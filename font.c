@@ -172,7 +172,8 @@ font_ensure_glyph(struct font *font, FT_UInt glyph_index)
 			if (!glyph)
 				return false;
 
-			FT_Load_Glyph(font->face, glyph_index, FT_LOAD_RENDER | FT_LOAD_MONOCHROME | FT_LOAD_TARGET_MONO);
+			FT_Load_Glyph(font->face, glyph_index,
+			              FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL);
 
 			FT_Bitmap_New(&glyph->bitmap);
 
@@ -217,7 +218,7 @@ wld_font_text_extents_n(struct wld_font *font_base,
 
 	extents->advance = 0;
 
-	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length) > 0) && c != '\0') {
+	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0 && c != '\0') {
 		length -= ret;
 		text += ret;
 		glyph_index = FT_Get_Char_Index(font->face, c);
