@@ -26,7 +26,11 @@
 
 #include <sys/types.h>
 #ifndef major
+
+#ifdef __linux__
 #include <sys/sysmacros.h>
+#endif
+
 #endif
 
 const static struct drm_driver *drivers[] = {

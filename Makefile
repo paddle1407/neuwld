@@ -2,7 +2,7 @@
 
 include config.mk
 
-PREFIX          ?= /usr/local
+PREFIX          ?= /usr
 LIBDIR          ?= $(PREFIX)/lib
 INCLUDEDIR      ?= $(PREFIX)/include
 PKGCONFIGDIR    ?= $(LIBDIR)/pkgconfig
@@ -87,8 +87,13 @@ WLD_PACKAGES        = $(WLD_REQUIRES) $(WLD_REQUIRES_PRIVATE)
 WLD_PACKAGE_CFLAGS ?= $(call pkgconfig,$(WLD_PACKAGES),cflags,CFLAGS)
 WLD_PACKAGE_LIBS   ?= $(call pkgconfig,$(WLD_PACKAGES),libs,LIBS)
 
+ifeq ($(shell uname),OpenBSD)
+    WLD_PACKAGE_LIBS += -lc
+endif
+
+
 FINAL_CFLAGS = $(CFLAGS) -fvisibility=hidden -std=c99 -Wvla
-FINAL_CPPFLAGS = $(CPPFLAGS) -D_XOPEN_SOURCE=700
+FINAL_CPPFLAGS = $(CPPFLAGS)
 
 # Warning/error flags
 FINAL_CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int \
@@ -98,6 +103,10 @@ FINAL_CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int \
 ifeq ($(shell uname),NetBSD)
     # Needed for mkostemp
     FINAL_CPPFLAGS += -D_NETBSD_SOURCE
+endif
+
+ifeq ($(shell uname),Linux)
+    FINAL_CPPFLAGS += -D_POSIX_C_SOURCE=200809L
 endif
 
 ifeq ($(ENABLE_DEBUG),1)
@@ -188,4 +197,3 @@ clean:
 	rm -rf $(CLEAN_FILES)
 
 -include .deps/*.d
-

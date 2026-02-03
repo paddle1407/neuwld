@@ -177,8 +177,15 @@ context_create_buffer(struct wld_context *base,
 
 	unlink(name);
 
+#if defined(__linux__)
+	/* try to preallocate */
 	if (posix_fallocate(fd, 0, size) != 0 && ftruncate(fd, size) != 0)
 		goto error2;
+#else
+	/* ftruncate() is enough otherwise */
+	if (ftruncate(fd, size) != 0)
+		goto error2;
+#endif
 
 	if (!(pool = wl_shm_create_pool(context->wl, fd, size)))
 		goto error2;
