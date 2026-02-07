@@ -140,7 +140,7 @@ wld_copy_region(struct wld_renderer *renderer,
 }
 
 
-/* https://en.wikipedia.org/wiki/Midpoint_circle_algorithm :wq*/
+/* https://en.wikipedia.org/wiki/Midpoint_circle_algorithm */
 static void
 circle_points(struct wld_renderer *renderer, uint32_t color,
 			 int32_t x1, int32_t y1, int32_t x2, int32_t y2, bool fill)
