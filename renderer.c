@@ -139,6 +139,55 @@ wld_copy_region(struct wld_renderer *renderer,
 	                            dst_x, dst_y, region);
 }
 
+
+/* https://en.wikipedia.org/wiki/Midpoint_circle_algorithm :wq*/
+static void
+circle_points(struct wld_renderer *renderer, uint32_t color,
+			 int32_t x1, int32_t y1, int32_t x2, int32_t y2, bool fill)
+{
+	/* hacky */
+	if (fill) {
+		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1+y2, 2*x2 + 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1-y2, 2*x2 + 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1+x2, 2*y2 + 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1-x2, 2*y2 + 1, 1);
+	}
+	
+	else {
+		renderer->impl->fill_rectangle(renderer, color, x1+x2, y1+y2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1+y2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1+x2, y1-y2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1-y2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1+y2, y1+x2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1+x2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1+y2, y1-x2, 1, 1);
+		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1-x2, 1, 1);
+	}
+}
+
+EXPORT
+void
+wld_draw_circle(struct wld_renderer *renderer, uint32_t color, 
+				int32_t x, int32_t y, uint32_t r, bool fill)
+{
+	int32_t x1 = 0, y1 = r;
+	int32_t d = 3 - 2 * r;
+	circle_points(renderer, color, x, y, x1, y1, fill);
+
+	while (y1 >= x1) {
+		if (d > 0) {
+			y1--;
+			d = d + 4 * (x1 - y1) + 10;
+		}
+		else
+			d = d + 4 * x1 + 6;
+
+		x1++;
+
+		circle_points(renderer, color, x, y, x1, y1, fill);
+	}
+}
+
 EXPORT
 void
 wld_draw_text(struct wld_renderer *renderer,

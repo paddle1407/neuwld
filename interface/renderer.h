@@ -33,6 +33,7 @@ static void renderer_copy_rectangle(struct wld_renderer *renderer,
                                     int32_t dst_x, int32_t dst_y,
                                     int32_t src_x, int32_t src_y,
                                     uint32_t width, uint32_t height);
+
 #ifdef RENDERER_IMPLEMENTS_REGION
 static void renderer_fill_region(struct wld_renderer *base, uint32_t color,
                                  pixman_region32_t *region);
@@ -61,6 +62,7 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 	.fill_region = &default_fill_region,
 	.copy_region = &default_copy_region,
 #endif
+	.draw_circle = &wld_draw_circle,
 	.draw_text = &renderer_draw_text,
 	.flush = &renderer_flush,
 	.destroy = &renderer_destroy
