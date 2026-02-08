@@ -190,6 +190,35 @@ wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
 
 EXPORT
 void
+wld_draw_line(struct wld_renderer *renderer, uint32_t color,
+			 int32_t x1, int32_t y1, int32_t x2, int32_t y2)
+{
+	int32_t dx = abs(x2-x1),  sx = x1<x2 ? 1 : -1;
+	int32_t dy = -abs(y2-y1), sy = y1<y2 ? 1 : -1;
+	int32_t err = dx+dy, e2;
+
+	while(true) {
+		renderer->impl->fill_rectangle(renderer, color, x1, y1, 1, 1);
+
+		if (x1==x2 && y1==y2)
+			break;
+		
+		e2 = 2*err;
+		
+		if (e2 >= dy) {
+			err += dy;
+			x1 += sx;
+		}
+
+		if (e2 <= dx) {
+			err += dx;
+			y1 += sy;
+		}
+	}
+}
+
+EXPORT
+void
 wld_draw_text(struct wld_renderer *renderer,
               struct wld_font *font_base, uint32_t color,
               int32_t x, int32_t y, const char *text, uint32_t length,

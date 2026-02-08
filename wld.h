@@ -254,7 +254,10 @@ void wld_copy_region(struct wld_renderer *renderer,
                      int32_t dst_x, int32_t dst_y, pixman_region32_t *region);
 
 void wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
-				int32_t x, int32_t y, uint32_t r, bool fill); 
+				int32_t x, int32_t y, uint32_t r, bool fill);
+
+void wld_draw_line(struct wld_renderer *renderer, uint32_t color,
+			 int32_t x1, int32_t y1, int32_t x2, int32_t y2);
 
 /**
  * Draw a UTF-8 text string to the given buffer.

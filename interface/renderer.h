@@ -63,6 +63,7 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 	.copy_region = &default_copy_region,
 #endif
 	.draw_circle = &wld_draw_circle,
+	.draw_line = &wld_draw_line,
 	.draw_text = &renderer_draw_text,
 	.flush = &renderer_flush,
 	.destroy = &renderer_destroy
