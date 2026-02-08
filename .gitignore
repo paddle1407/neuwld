@@ -1,11 +1,16 @@
-*.o
+# Autotools / libtool
+.deps/
 *.lo
-.*.sw*
+*.o
 
-/.deps/
-/libwld.a
-/libwld.so*
-/wld.pc
-/protocol/wayland-drm-client-protocol.h
-/protocol/wayland-drm-protocol.c
+# Libraries
+*.a
+*.so
+*.so.*
+libwld.*
 
+# pkg-config
+*.pc
+
+# Generated Wayland protocol files
+protocol/*-protocol.*
