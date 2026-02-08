@@ -1,199 +1,205 @@
-# wld: Makefile
+# wld bmake 
 
-include config.mk
+.include "config.mk"
 
-PREFIX          ?= /usr
-LIBDIR          ?= $(PREFIX)/lib
-INCLUDEDIR      ?= $(PREFIX)/include
-PKGCONFIGDIR    ?= $(LIBDIR)/pkgconfig
+PREFIX?=        /usr
+LIBDIR?=        ${PREFIX}/lib
+INCLUDEDIR?=    ${PREFIX}/include
+PKGCONFIGDIR?=  ${LIBDIR}/pkgconfig
 
-PKG_CONFIG      ?= pkg-config
-WAYLAND_SCANNER ?= wayland-scanner
+PKG_CONFIG?=    pkg-config
+WAYLAND_SCANNER?=wayland-scanner
+INSTALL?=       install
+AR?=            ar
+CC?=            cc
 
-VERSION_MAJOR   := 0
-VERSION_MINOR   := 0
-VERSION         := $(VERSION_MAJOR).$(VERSION_MINOR)
+VERSION_MAJOR=0
+VERSION_MINOR=0
+VERSION=${VERSION_MAJOR}.${VERSION_MINOR}
 
-WLD_LIB_LINK    := libwld.so
-WLD_LIB_SONAME  := $(WLD_LIB_LINK).$(VERSION_MAJOR)
-WLD_LIB         := $(WLD_LIB_LINK).$(VERSION)
+WLD_LIB_LINK=libwld.so
+WLD_LIB_SONAME=${WLD_LIB_LINK}.${VERSION_MAJOR}
+WLD_LIB=${WLD_LIB_LINK}.${VERSION}
 
-TARGETS         := wld.pc
-CLEAN_FILES     :=
+WLD_REQUIRES=fontconfig pixman-1
+WLD_REQUIRES_PRIVATE=freetype2
 
-WLD_REQUIRES = fontconfig pixman-1
-WLD_REQUIRES_PRIVATE = freetype2
-WLD_SOURCES =           \
-    buffer.c            \
-    buffered_surface.c  \
-    color.c             \
-    context.c           \
-    font.c              \
-    renderer.c          \
+WLD_SOURCES= \
+    buffer.c \
+    buffered_surface.c \
+    color.c \
+    context.c \
+    font.c \
+    renderer.c \
     surface.c
-WLD_HEADERS = wld.h
 
-ifeq ($(ENABLE_DRM),1)
-    WLD_REQUIRES_PRIVATE += libdrm
-    WLD_SOURCES += drm.c dumb.c
-    WLD_HEADERS += drm.h
+WLD_HEADERS=wld.h
 
-    ifneq ($(findstring intel,$(DRM_DRIVERS)),)
-        WLD_REQUIRES_PRIVATE += libdrm_intel
-        WLD_SOURCES += intel.c intel/batch.c
-        WLD_CPPFLAGS += -DWITH_DRM_INTEL=1
-    endif
+.if ${ENABLE_DRM} == 1
+WLD_REQUIRES_PRIVATE+=libdrm
+WLD_SOURCES+=drm.c dumb.c
+WLD_HEADERS+=drm.h
 
-    ifneq ($(findstring nouveau,$(DRM_DRIVERS)),)
-        WLD_REQUIRES_PRIVATE += libdrm_nouveau
-        WLD_SOURCES += nouveau.c
-        WLD_CPPFLAGS += -DWITH_DRM_NOUVEAU=1
-    endif
-endif
+.if !empty(DRM_DRIVERS:Mintel)
+WLD_REQUIRES_PRIVATE+=libdrm_intel
+WLD_SOURCES+=intel.c intel/batch.c
+WLD_CPPFLAGS+=-DWITH_DRM_INTEL=1
+.endif
 
-ifeq ($(ENABLE_PIXMAN),1)
-    WLD_SOURCES += pixman.c
-    WLD_HEADERS += pixman.h
-endif
+.if !empty(DRM_DRIVERS:Mnouveau)
+WLD_REQUIRES_PRIVATE+=libdrm_nouveau
+WLD_SOURCES+=nouveau.c
+WLD_CPPFLAGS+=-DWITH_DRM_NOUVEAU=1
+.endif
+.endif
 
-ifeq ($(ENABLE_WAYLAND),1)
-    WLD_REQUIRES_PRIVATE += wayland-client
-    WLD_SOURCES += wayland.c
-    WLD_HEADERS += wayland.h
+.if ${ENABLE_PIXMAN} == 1
+WLD_SOURCES+=pixman.c
+WLD_HEADERS+=pixman.h
+.endif
 
-    ifneq ($(findstring shm,$(WAYLAND_INTERFACES)),)
-        WLD_SOURCES += wayland-shm.c
-        WLD_CPPFLAGS += -DWITH_WAYLAND_SHM=1
-    endif
+.if ${ENABLE_WAYLAND} == 1
+WLD_REQUIRES_PRIVATE+=wayland-client
+WLD_SOURCES+=wayland.c
+WLD_HEADERS+=wayland.h
 
-    ifneq ($(findstring drm,$(WAYLAND_INTERFACES)),)
-        WLD_SOURCES += wayland-drm.c protocol/wayland-drm-protocol.c
-        WLD_CPPFLAGS += -DWITH_WAYLAND_DRM=1
-    endif
-endif
+.if !empty(WAYLAND_INTERFACES:Mshm)
+WLD_SOURCES+=wayland-shm.c
+WLD_CPPFLAGS+=-DWITH_WAYLAND_SHM=1
+.endif
 
-ifeq ($(if $(V),$(V),0), 0)
-    define quiet
-        @echo "  $1	$@"
-        @$(if $2,$2,$($1))
-    endef
-else
-    quiet = $(if $2,$2,$($1))
-endif
+.if !empty(WAYLAND_INTERFACES:Mdrm)
+WLD_SOURCES+=wayland-drm.c protocol/wayland-drm-protocol.c
+WLD_CPPFLAGS+=-DWITH_WAYLAND_DRM=1
+WAYLAND_DRM_XML=protocol/wayland-drm.xml
+.endif
+.endif
 
-WLD_STATIC_OBJECTS  = $(WLD_SOURCES:%.c=%.o)
-WLD_SHARED_OBJECTS  = $(WLD_SOURCES:%.c=%.lo)
-WLD_PACKAGES        = $(WLD_REQUIRES) $(WLD_REQUIRES_PRIVATE)
-WLD_PACKAGE_CFLAGS ?= $(call pkgconfig,$(WLD_PACKAGES),cflags,CFLAGS)
-WLD_PACKAGE_LIBS   ?= $(call pkgconfig,$(WLD_PACKAGES),libs,LIBS)
+WLD_PACKAGES=${WLD_REQUIRES} ${WLD_REQUIRES_PRIVATE}
+WLD_PKG_CFLAGS!=${PKG_CONFIG} --cflags ${WLD_PACKAGES}
+WLD_PKG_LIBS!=${PKG_CONFIG} --libs ${WLD_PACKAGES}
 
-ifeq ($(shell uname),OpenBSD)
-    WLD_PACKAGE_LIBS += -lc
-endif
+.if ${.MAKE.OS} == "OpenBSD"
+WLD_PKG_LIBS+=-lc
+.endif
 
+CPPFLAGS+=${WLD_PKG_CFLAGS} ${WLD_CPPFLAGS}
 
-FINAL_CFLAGS = $(CFLAGS) -fvisibility=hidden -std=c99 -Wvla
-FINAL_CPPFLAGS = $(CPPFLAGS)
+CFLAGS+=-fvisibility=hidden -std=c99 -Wvla
+CFLAGS+=-Wall -Werror=implicit-function-declaration \
+        -Werror=implicit-int -Werror=pointer-sign \
+        -Werror=pointer-arith
 
-# Warning/error flags
-FINAL_CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int \
-                -Werror=pointer-sign -Werror=pointer-arith \
-                -Wall -Wno-missing-braces
+.if ${.MAKE.OS} == "NetBSD"
+CPPFLAGS+=-D_NETBSD_SOURCE
+.endif
 
-ifeq ($(shell uname),NetBSD)
-    # Needed for mkostemp
-    FINAL_CPPFLAGS += -D_NETBSD_SOURCE
-endif
+.if ${.MAKE.OS} == "Linux"
+CPPFLAGS+=-D_POSIX_C_SOURCE=200809L
+.endif
 
-ifeq ($(shell uname),Linux)
-    FINAL_CPPFLAGS += -D_POSIX_C_SOURCE=200809L
-endif
+.if ${ENABLE_DEBUG} == 1
+CPPFLAGS+=-DENABLE_DEBUG=1
+CFLAGS+=-g
+.else
+CPPFLAGS+=-DNDEBUG
+.endif
 
-ifeq ($(ENABLE_DEBUG),1)
-    FINAL_CPPFLAGS += -DENABLE_DEBUG=1
-    FINAL_CFLAGS += -g
-else
-    FINAL_CPPFLAGS += -DNDEBUG
-endif
+STATIC_OBJECTS=${WLD_SOURCES:R:S/$/.o/g}
+SHARED_OBJECTS=${WLD_SOURCES:R:S/$/.lo/g}
 
-ifeq ($(ENABLE_STATIC),1)
-    TARGETS += libwld.a
-    CLEAN_FILES += $(WLD_STATIC_OBJECTS)
-endif
+DEPFLAGS=-MMD -MP -MF .deps/${.TARGET:T:R}.d
 
-ifeq ($(ENABLE_SHARED),1)
-    TARGETS += $(WLD_LIB) $(WLD_LIB_LINK) $(WLD_LIB_SONAME)
-    CLEAN_FILES += $(WLD_SHARED_OBJECTS)
-endif
-
-CLEAN_FILES += $(TARGETS)
-
-compile     = $(call quiet,CC) $(FINAL_CPPFLAGS) $(FINAL_CFLAGS) -c -o $@ $< \
-              -MMD -MP -MF .deps/$(basename $<).d -MT $(basename $@).o -MT $(basename $@).lo
-link        = $(call quiet,CCLD,$(CC)) $(LDFLAGS) -o $@ $^
-pkgconfig   = $(sort $(foreach pkg,$(1),$(if $($(pkg)_$(3)),$($(pkg)_$(3)), \
-                                           $(shell $(PKG_CONFIG) --$(2) $(pkg)))))
-
-.PHONY: all
-all: $(TARGETS)
-
-include $(foreach dir,intel protocol,$(dir)/local.mk)
+.SUFFIXES: .c .o .lo
 
 .deps:
-	@mkdir "$@"
+	@mkdir -p $@
 
-%.o: %.c | .deps
-	$(compile) $(WLD_CPPFLAGS) $(WLD_PACKAGE_CFLAGS)
+.c.o: .deps
+	@echo "  CC  $@"
+	@${CC} ${CPPFLAGS} ${CFLAGS} ${DEPFLAGS} -c $< -o $@
 
-%.lo: %.c | .deps
-	$(compile) $(WLD_CPPFLAGS) $(WLD_PACKAGE_CFLAGS) -fPIC
+.c.lo: .deps
+	@echo "  CC  $@"
+	@${CC} ${CPPFLAGS} ${CFLAGS} -fPIC ${DEPFLAGS} -c $< -o $@
+
+.if defined(WAYLAND_DRM_XML)
+protocol/wayland-drm-protocol.c: ${WAYLAND_DRM_XML}
+	@echo "  GEN $@"
+	@${WAYLAND_SCANNER:Uwayland-scanner} private-code ${.ALLSRC} $@
+
+protocol/wayland-drm-client-protocol.h: ${WAYLAND_DRM_XML}
+	@echo "  GEN $@"
+	@${WAYLAND_SCANNER:Uwayland-scanner} client-header ${.ALLSRC} $@
 
 wayland-drm.o wayland-drm.lo: protocol/wayland-drm-client-protocol.h
+.endif
+
+.if ${ENABLE_STATIC} == 1
+libwld.a: ${STATIC_OBJECTS}
+	@echo "  AR  $@"
+	@${AR} rc $@ ${.ALLSRC}
+	@ranlib $@
+.endif
+
+.if ${ENABLE_SHARED} == 1
+${WLD_LIB}: ${SHARED_OBJECTS}
+	@echo "  LINK $@"
+	@${CC} -shared -Wl,-soname,${WLD_LIB_SONAME} \
+	    -o $@ ${.ALLSRC} ${WLD_PKG_LIBS}
+
+${WLD_LIB_SONAME}: ${WLD_LIB}
+	ln -sf ${WLD_LIB} $@
+
+${WLD_LIB_LINK}: ${WLD_LIB_SONAME}
+	ln -sf ${WLD_LIB_SONAME} $@
+.endif
 
 wld.pc: wld.pc.in
-	$(call quiet,GEN,sed)                                       \
-	    -e "s:@VERSION@:$(VERSION):"                            \
-	    -e "s:@PREFIX@:$(PREFIX):"                              \
-	    -e "s:@LIBDIR@:$(LIBDIR):"                              \
-	    -e "s:@INCLUDEDIR@:$(INCLUDEDIR):"                      \
-	    -e "s:@WLD_REQUIRES@:$(WLD_REQUIRES):"                  \
-	    -e "s:@WLD_REQUIRES_PRIVATE@:$(WLD_REQUIRES_PRIVATE):"  \
-	    $< > $@
+	@echo "  GEN $@"
+	@sed -e "s:@VERSION@:${VERSION}:" \
+	     -e "s:@PREFIX@:${PREFIX}:" \
+	     -e "s:@LIBDIR@:${LIBDIR}:" \
+	     -e "s:@INCLUDEDIR@:${INCLUDEDIR}:" \
+	     -e "s:@WLD_REQUIRES@:${WLD_REQUIRES}:" \
+	     -e "s:@WLD_REQUIRES_PRIVATE@:${WLD_REQUIRES_PRIVATE}:" \
+	     ${.ALLSRC} > $@
 
-libwld.a: $(WLD_STATIC_OBJECTS)
-	$(call quiet,AR) cr $@ $^
-
-$(WLD_LIB): $(WLD_SHARED_OBJECTS)
-	$(link) $(WLD_PACKAGE_LIBS) -shared -Wl,-soname,$(WLD_LIB_SONAME),-no-undefined
-
-$(WLD_LIB_SONAME) $(WLD_LIB_LINK): $(WLD_LIB)
-	$(call quiet,SYM,ln -sf) $< $@
-
-$(foreach dir,LIB PKGCONFIG,$(DESTDIR)$($(dir)DIR)) $(DESTDIR)$(INCLUDEDIR)/wld:
-	mkdir -p $@
-
-.PHONY: install-wld.pc
-install-wld.pc: wld.pc | $(DESTDIR)$(PKGCONFIGDIR)
-	install -m 644 $< $(DESTDIR)$(PKGCONFIGDIR)
-
-.PHONY: install-libwld.a
-install-libwld.a: libwld.a | $(DESTDIR)$(LIBDIR)
-	install -m 644 $< $(DESTDIR)$(LIBDIR)
-
-.PHONY: install-$(WLD_LIB)
-install-$(WLD_LIB): $(WLD_LIB) | $(DESTDIR)$(LIBDIR)
-	install -m 755 $< $(DESTDIR)$(LIBDIR)
-
-.PHONY: install-$(WLD_LIB_LINK) install-$(WLD_LIB_SONAME)
-install-$(WLD_LIB_LINK) install-$(WLD_LIB_SONAME): install-$(WLD_LIB) | $(DESTDIR)$(LIBDIR)
-	ln -sf $(WLD_LIB) $(DESTDIR)$(LIBDIR)/${@:install-%=%}
+.MAIN: all
+.PHONY: all
+all: wld.pc
+.if ${ENABLE_STATIC} == 1
+all: libwld.a
+.endif
+.if ${ENABLE_SHARED} == 1
+all: ${WLD_LIB} ${WLD_LIB_SONAME} ${WLD_LIB_LINK}
+.endif
 
 .PHONY: install
-install: $(TARGETS:%=install-%) | $(foreach dir,LIB PKGCONFIG,$(DESTDIR)$($(dir)DIR)) $(DESTDIR)$(INCLUDEDIR)/wld
-	install -m 644 $(WLD_HEADERS) $(DESTDIR)$(INCLUDEDIR)/wld
+install: all
+	${INSTALL} -d ${DESTDIR}${LIBDIR}
+	${INSTALL} -d ${DESTDIR}${INCLUDEDIR}/wld
+	${INSTALL} -d ${DESTDIR}${PKGCONFIGDIR}
+
+	${INSTALL} -m644 wld.pc ${DESTDIR}${PKGCONFIGDIR}
+	${INSTALL} -m644 ${WLD_HEADERS} ${DESTDIR}${INCLUDEDIR}/wld
+
+.if ${ENABLE_STATIC} == 1
+	${INSTALL} -m644 libwld.a ${DESTDIR}${LIBDIR}
+.endif
+
+.if ${ENABLE_SHARED} == 1
+	${INSTALL} -m755 ${WLD_LIB} ${DESTDIR}${LIBDIR}
+	cd ${DESTDIR}${LIBDIR} && ln -sf ${WLD_LIB} ${WLD_LIB_SONAME}
+	cd ${DESTDIR}${LIBDIR} && ln -sf ${WLD_LIB_SONAME} ${WLD_LIB_LINK}
+.endif
 
 .PHONY: clean
 clean:
-	rm -rf $(CLEAN_FILES)
+	rm -f ${STATIC_OBJECTS} ${SHARED_OBJECTS} \
+	    libwld.a ${WLD_LIB} ${WLD_LIB_LINK} \
+	    ${WLD_LIB_SONAME} wld.pc
+	rm -rf .deps protocol/wayland-drm-protocol.c \
+	    protocol/wayland-drm-client-protocol.h
 
--include .deps/*.d
+.sinclude ".deps/*.d"
