@@ -23,7 +23,7 @@
 
 #include "drm-private.h"
 #include "drm.h"
-#include "protocol/wayland-drm-client-protocol.h"
+#include "wayland-drm-client-protocol.h"
 #include "wayland-private.h"
 #include "wayland.h"
 #include "wld-private.h"
