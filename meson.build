@@ -14,6 +14,7 @@ project('wld', 'c',
 
 cc = meson.get_compiler('c')
 pkg = import('pkgconfig')
+inc = include_directories('.', 'protocol')
 
 c_args = cc.get_supported_arguments([
   '-fvisibility=hidden',
@@ -108,6 +109,7 @@ libwld_lib = library(
 	libwld_src,
 	dependencies: requires + requires_private,
 	c_args: c_args,
+	include_directories: inc,
 	# Prevents clashing with wld pixman.h
 	implicit_include_directories: false,
 	install: true,
