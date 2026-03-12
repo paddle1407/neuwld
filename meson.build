@@ -14,7 +14,7 @@ project('wld', 'c',
 
 cc = meson.get_compiler('c')
 pkg = import('pkgconfig')
-inc = include_directories('.', 'protocol')
+inc = include_directories('protocol')
 
 c_args = cc.get_supported_arguments([
   '-fvisibility=hidden',
