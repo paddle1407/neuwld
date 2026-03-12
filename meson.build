@@ -33,6 +33,7 @@ c_args = cc.get_supported_arguments([
   '-Wno-zero-length-array', # libdrm/i915_drm.h:2472
   '-Wno-varargs', # nouveau.c:332
   '-Wno-excess-initializers', # wayland.c:121
+  '-I' + meson.current_build_dir(),
 ]) + [
   '-D_POSIX_C_SOURCE=200809L', '-D_NETBSD_SOURCE',
   get_option('buildtype') == 'debug' ? '-DENABLE_DEBUG=1' : [],
