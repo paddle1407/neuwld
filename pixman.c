@@ -306,6 +306,7 @@ renderer_copy_rectangle(struct wld_renderer *base, struct buffer *buffer,
 
 	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, dst,
 	                         src_x, src_y, 0, 0, dst_x, dst_y, width, height);
+	pixman_image_unref(src);
 }
 
 void
@@ -331,6 +332,7 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
 	                         region->extents.y1 + dst_y,
 	                         region->extents.x2 - region->extents.x1,
 	                         region->extents.y2 - region->extents.y1);
+	pixman_image_unref(src);
 	pixman_image_set_clip_region32(dst, NULL);
 
 	pixman_region32_fini(&clip);
