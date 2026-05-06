@@ -29,6 +29,8 @@
 
 #ifdef __linux__
 #include <sys/sysmacros.h>
+#elif defined(__sun)
+#include <sys/mkdev.h>
 #endif
 
 #endif
@@ -46,6 +48,10 @@ const static struct drm_driver *drivers[] = {
 static const struct drm_driver *
 find_driver(int fd)
 {
+	#ifdef __sun
+	(void)fd;
+	return NULL;
+	#else
 	char path[64], id[32];
 	uint32_t vendor_id, device_id;
 	char *path_part;
@@ -85,6 +91,7 @@ find_driver(int fd)
 	}
 
 	return NULL;
+	#endif
 }
 
 EXPORT

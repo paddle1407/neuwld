@@ -35,6 +35,25 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+static int
+wldtmp(char *name)
+{
+	int fd;
+	int flags;
+
+	fd = mkstemp(name);
+	if (fd < 0)
+		return -1;
+
+	flags = fcntl(fd, F_GETFD);
+	if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
 struct shm_context {
 	struct wayland_context base;
 	struct wl_registry *registry;
@@ -170,7 +189,7 @@ context_create_buffer(struct wld_context *base,
 	if (!(buffer = malloc(sizeof *buffer)))
 		goto error0;
 
-	fd = mkostemp(name, O_CLOEXEC);
+	fd = wldtmp(name);
 
 	if (fd < 0)
 		goto error1;
