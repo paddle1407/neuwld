@@ -24,16 +24,7 @@
 #include "drm.h"
 #include "drm-private.h"
 
-#include <sys/types.h>
-#ifndef major
-
-#ifdef __linux__
-#include <sys/sysmacros.h>
-#elif defined(__sun)
-#include <sys/mkdev.h>
-#endif
-
-#endif
+#include <xf86drm.h>
 
 const static struct drm_driver *drivers[] = {
 #if WITH_DRM_INTEL
@@ -48,50 +39,29 @@ const static struct drm_driver *drivers[] = {
 static const struct drm_driver *
 find_driver(int fd)
 {
-	#ifdef __sun
-	(void)fd;
-	return NULL;
-	#else
-	char path[64], id[32];
+	drmDevicePtr device = NULL;
 	uint32_t vendor_id, device_id;
-	char *path_part;
-	struct stat st;
-	FILE *file;
 	uint32_t index;
-	int n;
+	const struct drm_driver *driver = NULL;
 
-	if (fstat(fd, &st) == -1)
+	if (drmGetDevice2(fd, 0, &device) != 0)
 		return NULL;
 
-	n = snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/", major(st.st_rdev), minor(st.st_rdev));
-	if (n + 6 >= sizeof(path))
-		return NULL;
-	path_part = path + n;
+	if (device->bustype != DRM_BUS_PCI || !device->deviceinfo.pci)
+		goto out;
 
-	strcpy(path_part, "vendor");
-	file = fopen(path, "r");
-	if (!file)
-		return NULL;
-	fgets(id, sizeof id, file);
-	fclose(file);
-	vendor_id = strtoul(id, NULL, 0);
-
-	strcpy(path_part, "device");
-	file = fopen(path, "r");
-	if (!file)
-		return NULL;
-	fgets(id, sizeof id, file);
-	fclose(file);
-	device_id = strtoul(id, NULL, 0);
+	vendor_id = device->deviceinfo.pci->vendor_id;
+	device_id = device->deviceinfo.pci->device_id;
 
 	for (index = 0; index < ARRAY_LENGTH(drivers); ++index) {
 		DEBUG("Trying DRM driver `%s'\n", drivers[index]->name);
 		if (drivers[index]->device_supported(vendor_id, device_id))
-			return drivers[index];
+			driver = drivers[index];
 	}
 
-	return NULL;
-	#endif
+out:
+	drmFreeDevice(&device);
+	return driver;
 }
 
 EXPORT
