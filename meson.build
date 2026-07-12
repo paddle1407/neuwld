@@ -81,7 +81,7 @@ if drm.found()
     dep = dependency('libdrm_' + driver, required: drivers.contains(driver))
     if dep.found()
       libwld_src += src
-      c_args += '-DWITH_DRM_@0@=1'.format(driver)
+      c_args += '-DWITH_DRM_@0@=1'.format(driver.to_upper())
       requires_private += dep
     endif
   endforeach

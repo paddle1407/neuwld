@@ -55,8 +55,10 @@ find_driver(int fd)
 
 	for (index = 0; index < ARRAY_LENGTH(drivers); ++index) {
 		DEBUG("Trying DRM driver `%s'\n", drivers[index]->name);
-		if (drivers[index]->device_supported(vendor_id, device_id))
+		if (drivers[index]->device_supported(vendor_id, device_id)) {
 			driver = drivers[index];
+			break;
+		}
 	}
 
 out:
