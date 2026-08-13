@@ -23,10 +23,16 @@
 
 static bool buffer_map(struct buffer *drawable);
 static bool buffer_unmap(struct buffer *drawable);
+#ifdef BUFFER_IMPLEMENTS_FLUSH
+static void buffer_flush(struct buffer *drawable);
+#endif
 static void buffer_destroy(struct buffer *drawable);
 
 static const struct wld_buffer_impl wld_buffer_impl = {
 	.map = &buffer_map,
 	.unmap = &buffer_unmap,
+#ifdef BUFFER_IMPLEMENTS_FLUSH
+	.flush = &buffer_flush,
+#endif
 	.destroy = &buffer_destroy
 };

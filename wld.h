@@ -253,6 +253,11 @@ void wld_copy_region(struct wld_renderer *renderer,
                      struct wld_buffer *buffer,
                      int32_t dst_x, int32_t dst_y, pixman_region32_t *region);
 
+void wld_blend_region(struct wld_renderer *renderer,
+                      struct wld_buffer *buffer,
+                      int32_t dst_x, int32_t dst_y,
+                      pixman_region32_t *region);
+
 void wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
 				int32_t x, int32_t y, uint32_t r, bool fill);
 

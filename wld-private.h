@@ -131,6 +131,7 @@ struct buffer {
 struct wld_buffer_impl {
 	bool (*map)(struct buffer *buffer);
 	bool (*unmap)(struct buffer *buffer);
+	void (*flush)(struct buffer *buffer);
 	void (*destroy)(struct buffer *buffer);
 };
 
