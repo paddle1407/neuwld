@@ -42,6 +42,12 @@ static void renderer_copy_region(struct wld_renderer *base,
                                  int32_t dst_x, int32_t dst_y,
                                  pixman_region32_t *region);
 #endif
+#ifdef RENDERER_IMPLEMENTS_BLEND
+static void renderer_blend_region(struct wld_renderer *base,
+                                  struct buffer *buffer,
+                                  int32_t dst_x, int32_t dst_y,
+                                  pixman_region32_t *region);
+#endif
 static void renderer_draw_text(struct wld_renderer *renderer,
                                struct font *font, uint32_t color,
                                int32_t x, int32_t y,
@@ -61,6 +67,11 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 #else
 	.fill_region = &default_fill_region,
 	.copy_region = &default_copy_region,
+#endif
+#ifdef RENDERER_IMPLEMENTS_BLEND
+	.blend_region = &renderer_blend_region,
+#else
+	.blend_region = NULL,
 #endif
 	.draw_circle = &wld_draw_circle,
 	.draw_line = &wld_draw_line,

@@ -33,6 +33,13 @@ const static struct drm_driver *drivers[] = {
 #if WITH_DRM_NOUVEAU
 	&nouveau_drm_driver,
 #endif
+#if WITH_DRM_GBM
+	/*
+	 * Generic GBM/EGL acceleration. Last before the software fallback, so
+	 * the hardware-specific drivers above keep priority where they apply.
+	 */
+	&gbm_drm_driver,
+#endif
 	&dumb_drm_driver
 };
 

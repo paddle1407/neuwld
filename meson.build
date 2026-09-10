@@ -85,6 +85,26 @@ if drm.found()
       requires_private += dep
     endif
   endforeach
+
+  # Generic GBM/EGL/GLES acceleration, for drivers with no libdrm_* of their
+  # own (notably the proprietary NVIDIA driver).
+  if drivers.contains('auto') or drivers.contains('gbm')
+    gbm_required = drivers.contains('gbm')
+    gbm_deps = [
+      dependency('gbm', required: gbm_required),
+      dependency('egl', required: gbm_required),
+      dependency('glesv2', required: gbm_required),
+    ]
+    gbm_found = true
+    foreach d : gbm_deps
+      gbm_found = gbm_found and d.found()
+    endforeach
+    if gbm_found
+      libwld_src += 'gbm.c'
+      c_args += '-DWITH_DRM_GBM=1'
+      requires_private += gbm_deps
+    endif
+  endif
 endif
 
 if wayland.found() and drm.found()

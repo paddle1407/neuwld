@@ -38,6 +38,9 @@ extern const struct drm_driver intel_drm_driver;
 #if WITH_DRM_NOUVEAU
 extern const struct drm_driver nouveau_drm_driver;
 #endif
+#if WITH_DRM_GBM
+extern const struct drm_driver gbm_drm_driver;
+#endif
 extern const struct drm_driver dumb_drm_driver;
 extern const struct wld_context_impl *dumb_context_impl;
 

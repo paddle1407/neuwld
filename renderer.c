@@ -155,6 +155,13 @@ wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	if (!renderer->target || !pixman_region32_not_empty(region))
 		return;
 
+	/* An accelerated backend blends on the GPU and skips the readback below. */
+	if (renderer->impl->blend_region) {
+		renderer->impl->blend_region(renderer, (struct buffer *)buffer,
+		                             dst_x, dst_y, region);
+		return;
+	}
+
 	/* Complete accelerator writes before accessing the buffers on the CPU. */
 	renderer->impl->flush(renderer);
 	if (!wld_map(buffer))
