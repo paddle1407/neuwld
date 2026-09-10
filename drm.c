@@ -43,13 +43,22 @@ const static struct drm_driver *drivers[] = {
 	&dumb_drm_driver
 };
 
-static const struct drm_driver *
-find_driver(int fd)
+/*
+ * Try each driver that claims this device, in priority order, until one
+ * produces a context.
+ *
+ * Trying only the first match is not enough: nouveau claims every NVIDIA PCI
+ * ID but supports only chipset families 0xc0 and 0xd0, so on anything newer it
+ * matches, fails to create a context, and would shadow the generic GBM driver
+ * behind it.
+ */
+static struct wld_context *
+create_driver_context(int fd)
 {
 	drmDevicePtr device = NULL;
 	uint32_t vendor_id, device_id;
+	struct wld_context *context = NULL;
 	uint32_t index;
-	const struct drm_driver *driver = NULL;
 
 	if (drmGetDevice2(fd, 0, &device) != 0)
 		return NULL;
@@ -61,32 +70,32 @@ find_driver(int fd)
 	device_id = device->deviceinfo.pci->device_id;
 
 	for (index = 0; index < ARRAY_LENGTH(drivers); ++index) {
+		if (!drivers[index]->device_supported(vendor_id, device_id))
+			continue;
+
 		DEBUG("Trying DRM driver `%s'\n", drivers[index]->name);
-		if (drivers[index]->device_supported(vendor_id, device_id)) {
-			driver = drivers[index];
+		if ((context = drivers[index]->create_context(fd)))
 			break;
-		}
+
+		DEBUG("DRM driver `%s' did not take the device\n",
+		      drivers[index]->name);
 	}
 
 out:
 	drmFreeDevice(&device);
-	return driver;
+	return context;
 }
 
 EXPORT
 struct wld_context *
 wld_drm_create_context(int fd)
 {
-	const struct drm_driver *driver;
 	struct wld_context *context;
 
 	if (!getenv("WLD_DRM_DUMB")) {
-		driver = find_driver(fd);
-		if (driver) {
-			context = driver->create_context(fd);
-			if (context)
-				return context;
-		}
+		context = create_driver_context(fd);
+		if (context)
+			return context;
 	}
 
 	DEBUG("Falling back to dumb DRM driver\n");

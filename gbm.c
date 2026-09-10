@@ -83,6 +83,15 @@ struct gbm_buffer {
 	uint32_t handle;
 	bool own_handle;
 	void *map_data;
+
+	/*
+	 * WLD_FLAG_MAP buffers are backed by a DRM dumb buffer rather than GBM.
+	 * NVIDIA will not sample or render a linear dmabuf, so these are uploaded
+	 * into an ordinary GL texture instead of being wrapped in an EGLImage.
+	 */
+	bool cpu;
+	size_t mapping_size;
+	bool dirty;
 };
 
 struct gles_renderer {
@@ -110,6 +119,7 @@ struct gles_renderer {
 	struct glyph_entry glyphs[GLYPH_CACHE_SIZE];
 };
 
+#define BUFFER_IMPLEMENTS_FLUSH
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
 #include "interface/buffer.h"
@@ -459,7 +469,7 @@ new_buffer(struct gbm_context *context, struct gbm_bo *bo, EGLImageKHR image,
 {
 	struct gbm_buffer *buffer;
 
-	if (!(buffer = malloc(sizeof *buffer)))
+	if (!(buffer = calloc(1, sizeof *buffer)))
 		return NULL;
 
 	buffer_initialize(&buffer->base, &wld_buffer_impl, width, height, format,
@@ -488,14 +498,72 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	uint32_t usage = GBM_BO_USE_RENDERING;
 	int fd;
 
+	/*
+	 * A buffer the CPU has to write cannot be a GBM buffer here. NVIDIA
+	 * refuses GBM_BO_USE_LINEAR alongside RENDERING, and a buffer created
+	 * with the LINEAR modifier can be neither rendered to nor sampled --
+	 * sampling one fails the draw with GL_INVALID_OPERATION.
+	 *
+	 * A DRM dumb buffer gives us what these are actually used for: CPU
+	 * writes, and a GEM handle for the cursor plane. When one is used as a
+	 * drawing source we upload it into a normal GL texture, the same way a
+	 * compositor handles a client's shm buffer.
+	 */
+	if (flags & WLD_FLAG_MAP) {
+		struct drm_mode_create_dumb create_dumb = {
+			.height = height,
+			.width = width,
+			.bpp = format_bytes_per_pixel(format) * 8,
+		};
+		struct drm_mode_map_dumb map_dumb;
+		struct gbm_buffer *cpu_buffer;
+		void *data;
+
+		if (drmIoctl(context->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
+			DEBUG("DRM_IOCTL_MODE_CREATE_DUMB failed\n");
+			return NULL;
+		}
+
+		map_dumb = (struct drm_mode_map_dumb){ .handle = create_dumb.handle };
+		if (drmIoctl(context->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
+			goto error_dumb;
+
+		data = mmap(NULL, create_dumb.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		            context->fd, map_dumb.offset);
+		if (data == MAP_FAILED)
+			goto error_dumb;
+
+		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, create_dumb.handle,
+		                    false, width, height, format, create_dumb.pitch);
+		if (!buffer) {
+			munmap(data, create_dumb.size);
+			goto error_dumb;
+		}
+
+		cpu_buffer = gbm_buffer(&buffer->base);
+		cpu_buffer->cpu = true;
+		cpu_buffer->mapping_size = create_dumb.size;
+		cpu_buffer->dirty = true;
+		buffer->base.map = data;
+
+		return buffer;
+
+	error_dumb: {
+		struct drm_mode_destroy_dumb destroy_dumb = {
+			.handle = create_dumb.handle
+		};
+		drmIoctl(context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+	}
+		return NULL;
+	}
+
 	if (flags & WLD_DRM_FLAG_SCANOUT)
 		usage |= GBM_BO_USE_SCANOUT;
-	/* A mappable buffer must be linear, or the CPU sees a tiled mess. */
-	if (flags & WLD_FLAG_MAP)
-		usage |= GBM_BO_USE_LINEAR;
 
-	if (!(bo = gbm_bo_create(context->gbm, width, height, format, usage)))
+	if (!(bo = gbm_bo_create(context->gbm, width, height, format, usage))) {
+		DEBUG("gbm_bo_create failed (%ux%u flags 0x%x)\n", width, height, flags);
 		return NULL;
+	}
 
 	if ((fd = gbm_bo_get_fd(bo)) < 0)
 		goto error0;
@@ -579,6 +647,10 @@ buffer_map(struct buffer *base)
 	uint32_t stride;
 	void *data;
 
+	/* Dumb buffers stay mapped for their lifetime. */
+	if (buffer->cpu)
+		return base->base.map != NULL;
+
 	/* Imported client dmabufs are not CPU accessible through GBM. */
 	if (!buffer->bo)
 		return false;
@@ -608,6 +680,12 @@ buffer_unmap(struct buffer *base)
 {
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
+	if (buffer->cpu) {
+		/* The CPU may have written; the texture is now stale. */
+		buffer->dirty = true;
+		return true;
+	}
+
 	if (!buffer->bo || !buffer->map_data)
 		return false;
 
@@ -619,12 +697,39 @@ buffer_unmap(struct buffer *base)
 }
 
 void
+buffer_flush(struct buffer *base)
+{
+	struct gbm_buffer *buffer = gbm_buffer(&base->base);
+
+	/*
+	 * Called once the renderer targeting this buffer is done with it, which
+	 * for a dumb buffer means the CPU has just finished drawing into it.
+	 */
+	if (buffer->cpu)
+		buffer->dirty = true;
+}
+
+void
 buffer_destroy(struct buffer *base)
 {
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
 	if (buffer->texture)
 		glDeleteTextures(1, &buffer->texture);
+
+	if (buffer->cpu) {
+		struct drm_mode_destroy_dumb destroy_dumb = {
+			.handle = buffer->handle
+		};
+
+		if (base->base.map)
+			munmap(base->base.map, buffer->mapping_size);
+		drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB,
+		         &destroy_dumb);
+		free(buffer);
+		return;
+	}
+
 	if (buffer->image != EGL_NO_IMAGE_KHR) {
 		buffer->context->destroy_image(buffer->context->display,
 		                               buffer->image);
@@ -645,19 +750,58 @@ buffer_destroy(struct buffer *base)
 static GLuint
 buffer_texture(struct gbm_buffer *buffer)
 {
-	if (buffer->texture)
-		return buffer->texture;
+	bool fresh = buffer->texture == 0;
 
-	if (buffer->image == EGL_NO_IMAGE_KHR)
-		return 0;
+	if (fresh) {
+		if (!buffer->cpu && buffer->image == EGL_NO_IMAGE_KHR)
+			return 0;
 
-	glGenTextures(1, &buffer->texture);
-	glBindTexture(GL_TEXTURE_2D, buffer->texture);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	buffer->context->image_target_texture_2d(GL_TEXTURE_2D, buffer->image);
+		glGenTextures(1, &buffer->texture);
+		glBindTexture(GL_TEXTURE_2D, buffer->texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		if (!buffer->cpu) {
+			buffer->context->image_target_texture_2d(GL_TEXTURE_2D,
+			                                         buffer->image);
+			return buffer->texture;
+		}
+	}
+
+	/* Dumb-buffer contents live in system memory, so upload what changed. */
+	if (buffer->cpu && (fresh || buffer->dirty)) {
+		if (!buffer->base.base.map)
+			return 0;
+
+		glBindTexture(GL_TEXTURE_2D, buffer->texture);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		/*
+		 * GLES2 has no GL_UNPACK_ROW_LENGTH, so a padded pitch cannot be
+		 * uploaded in one call. wld only ever hands us 4-byte pixels, and
+		 * dumb pitches are a multiple of that, so walk rows when padded.
+		 */
+		if (buffer->base.base.pitch == buffer->base.base.width * 4) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT,
+			             buffer->base.base.width, buffer->base.base.height, 0,
+			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, buffer->base.base.map);
+		} else {
+			uint32_t y;
+
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT,
+			             buffer->base.base.width, buffer->base.base.height, 0,
+			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+			for (y = 0; y < buffer->base.base.height; ++y) {
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y,
+				                buffer->base.base.width, 1, GL_BGRA_EXT,
+				                GL_UNSIGNED_BYTE,
+				                (uint8_t *)buffer->base.base.map
+				                    + (size_t)y * buffer->base.base.pitch);
+			}
+		}
+		buffer->dirty = false;
+	}
 
 	return buffer->texture;
 }

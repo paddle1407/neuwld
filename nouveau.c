@@ -129,7 +129,7 @@ driver_create_context(int drm_fd)
 		break;
 	*/
 	default:
-		return NULL;
+		goto error2;
 	}
 
 	if (nouveau_client_new(context->device, &context->client) != 0)
