@@ -53,6 +53,11 @@ static void renderer_draw_text(struct wld_renderer *renderer,
                                int32_t x, int32_t y,
                                const char *text, uint32_t length,
                                struct wld_extents *extents);
+#ifdef RENDERER_IMPLEMENTS_READ_PIXELS
+static bool renderer_read_pixels(struct wld_renderer *renderer, int32_t x,
+                                 int32_t y, uint32_t width, uint32_t height,
+                                 uint32_t pitch, void *data);
+#endif
 static void renderer_flush(struct wld_renderer *renderer);
 static void renderer_destroy(struct wld_renderer *renderer);
 
@@ -77,5 +82,10 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 	.draw_line = &wld_draw_line,
 	.draw_text = &renderer_draw_text,
 	.flush = &renderer_flush,
+#ifdef RENDERER_IMPLEMENTS_READ_PIXELS
+	.read_pixels = &renderer_read_pixels,
+#else
+	.read_pixels = NULL,
+#endif
 	.destroy = &renderer_destroy
 };

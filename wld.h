@@ -227,6 +227,15 @@ enum wld_capability {
 	WLD_CAPABILITY_WRITE = 1 << 1,
 };
 
+/**
+ * Read the renderer's current target back into 'data' as XRGB8888/ARGB8888.
+ *
+ * Returns false if the backend cannot read back.
+ */
+bool wld_read_pixels(struct wld_renderer *renderer, int32_t x, int32_t y,
+                     uint32_t width, uint32_t height, uint32_t pitch,
+                     void *data);
+
 void wld_destroy_renderer(struct wld_renderer *renderer);
 
 uint32_t wld_capabilities(struct wld_renderer *renderer,

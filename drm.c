@@ -103,6 +103,17 @@ wld_drm_create_context(int fd)
 }
 
 EXPORT
+int
+wld_drm_query_modifiers(struct wld_context *context, uint32_t format,
+                        uint64_t *modifiers, int max)
+{
+	if (!context->impl->query_modifiers)
+		return -1;
+
+	return context->impl->query_modifiers(context, format, modifiers, max);
+}
+
+EXPORT
 bool
 wld_drm_is_dumb(struct wld_context *context)
 {

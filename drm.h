@@ -40,6 +40,21 @@ enum wld_drm_object_type {
 	 * linear and rejected.
 	 */
 	WLD_DRM_OBJECT_MODIFIER,
+	/**
+	 * A dmabuf with an explicit format modifier.
+	 *
+	 * object.ptr points at a struct wld_dmabuf_attributes. Unlike
+	 * WLD_DRM_OBJECT_PRIME_FD this carries the layout, which a tiled buffer
+	 * cannot be imported correctly without.
+	 */
+	WLD_DRM_OBJECT_DMABUF,
+};
+
+struct wld_dmabuf_attributes {
+	int fd;
+	uint32_t offset;
+	uint32_t pitch;
+	uint64_t modifier;
 };
 
 enum wld_drm_flags {
@@ -53,5 +68,12 @@ enum wld_drm_flags {
 struct wld_context *wld_drm_create_context(int fd);
 
 bool wld_drm_is_dumb(struct wld_context *context);
+
+/**
+ * Fill 'modifiers' with the DRM format modifiers this context can import for
+ * 'format'. Returns the number written, or -1 if the backend cannot say.
+ */
+int wld_drm_query_modifiers(struct wld_context *context, uint32_t format,
+                            uint64_t *modifiers, int max);
 
 #endif

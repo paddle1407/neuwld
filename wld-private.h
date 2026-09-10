@@ -89,6 +89,12 @@ struct wld_context_impl {
 	struct wld_surface *(*create_surface)(struct wld_context *context,
 	                                      uint32_t width, uint32_t height,
 	                                      uint32_t format, uint32_t flags);
+	/**
+	 * Optional. Fills 'modifiers' with the DRM format modifiers this context
+	 * can import for 'format', returning the count, or -1 if unknown.
+	 */
+	int (*query_modifiers)(struct wld_context *context, uint32_t format,
+	                       uint64_t *modifiers, int max);
 	void (*destroy)(struct wld_context *context);
 };
 
@@ -125,6 +131,15 @@ struct wld_renderer_impl {
 	                  int32_t x, int32_t y, const char *text, uint32_t length,
 	                  struct wld_extents *extents);
 	void (*flush)(struct wld_renderer *renderer);
+	/**
+	 * Optional. Reads back the current target into 'data'. Lets a caller
+	 * capture what an accelerated backend composited, which it cannot do by
+	 * mapping the target: buffers imported from clients are not CPU
+	 * accessible.
+	 */
+	bool (*read_pixels)(struct wld_renderer *renderer, int32_t x, int32_t y,
+	                    uint32_t width, uint32_t height, uint32_t pitch,
+	                    void *data);
 	void (*destroy)(struct wld_renderer *renderer);
 };
 

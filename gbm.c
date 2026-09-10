@@ -67,6 +67,7 @@ struct gbm_context {
 	PFNEGLCREATEIMAGEKHRPROC create_image;
 	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture_2d;
+	PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dmabuf_modifiers;
 
 	bool has_modifiers;
 	bool has_unpack_subimage;
@@ -122,9 +123,11 @@ struct gles_renderer {
 	struct glyph_entry glyphs[GLYPH_CACHE_SIZE];
 };
 
+#define CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
 #define BUFFER_IMPLEMENTS_FLUSH
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
+#define RENDERER_IMPLEMENTS_READ_PIXELS
 #include "interface/buffer.h"
 #include "interface/context.h"
 #include "interface/renderer.h"
@@ -375,6 +378,8 @@ driver_create_context(int drm_fd)
 	    eglGetProcAddress("eglDestroyImageKHR");
 	context->image_target_texture_2d = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
 	    eglGetProcAddress("glEGLImageTargetTexture2DOES");
+	context->query_dmabuf_modifiers = (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)
+	    eglGetProcAddress("eglQueryDmaBufModifiersEXT");
 
 	if (!context->create_image || !context->destroy_image
 	    || !context->image_target_texture_2d) {
@@ -645,18 +650,36 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 	struct buffer *buffer;
 	uint32_t handle;
 
-	if (type != WLD_DRM_OBJECT_PRIME_FD)
-		return NULL;
+	int fd;
+	uint32_t offset = 0;
+	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 
-	image = image_from_dmabuf(context, object.i, width, height, format, pitch,
-	                          0, DRM_FORMAT_MOD_INVALID);
+	switch (type) {
+	case WLD_DRM_OBJECT_PRIME_FD:
+		fd = object.i;
+		break;
+	case WLD_DRM_OBJECT_DMABUF: {
+		const struct wld_dmabuf_attributes *attributes = object.ptr;
+
+		fd = attributes->fd;
+		offset = attributes->offset;
+		pitch = attributes->pitch;
+		modifier = attributes->modifier;
+		break;
+	}
+	default:
+		return NULL;
+	}
+
+	image = image_from_dmabuf(context, fd, width, height, format, pitch, offset,
+	                          modifier);
 	if (image == EGL_NO_IMAGE_KHR) {
 		DEBUG("failed to import client dmabuf as EGLImage\n");
 		return NULL;
 	}
 
 	/* Needed only if this buffer is ever scanned out directly. */
-	if (drmPrimeFDToHandle(context->fd, object.i, &handle) != 0)
+	if (drmPrimeFDToHandle(context->fd, fd, &handle) != 0)
 		handle = 0;
 
 	buffer = new_buffer(context, NULL, image, handle, handle != 0, width,
@@ -667,6 +690,34 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 	}
 
 	return buffer;
+}
+
+int
+context_query_modifiers(struct wld_context *base, uint32_t format,
+                        uint64_t *modifiers, int max)
+{
+	struct gbm_context *context = gbm_context(base);
+	EGLint count = 0;
+
+	if (!context->query_dmabuf_modifiers || !context->has_modifiers)
+		return -1;
+
+	if (!context->query_dmabuf_modifiers(context->display, format, 0, NULL, NULL,
+	                                     &count)) {
+		return -1;
+	}
+	if (count > max)
+		count = max;
+	if (count <= 0)
+		return 0;
+
+	if (!context->query_dmabuf_modifiers(context->display, format, count,
+	                                     (EGLuint64KHR *)modifiers, NULL,
+	                                     &count)) {
+		return -1;
+	}
+
+	return count;
 }
 
 void
@@ -1236,6 +1287,38 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 
 	if (extents)
 		extents->advance = origin_x;
+}
+
+bool
+renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
+                     uint32_t width, uint32_t height, uint32_t pitch,
+                     void *data)
+{
+	struct gles_renderer *renderer = gles_renderer(base);
+	uint32_t row_bytes = width * 4;
+
+	if (!renderer->target_texture)
+		return false;
+
+	glFinish();
+
+	/*
+	 * GLES2 has no GL_PACK_ROW_LENGTH, so a destination with padding has to
+	 * be filled a row at a time. glReadPixels' y origin matches ours, since
+	 * rendering into an FBO puts window y 0 at the first row in memory.
+	 */
+	if (pitch == row_bytes) {
+		glReadPixels(x, y, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
+	} else {
+		uint32_t row;
+
+		for (row = 0; row < height; ++row) {
+			glReadPixels(x, y + (int32_t)row, width, 1, GL_BGRA_EXT,
+			             GL_UNSIGNED_BYTE, (uint8_t *)data + (size_t)row * pitch);
+		}
+	}
+
+	return glGetError() == GL_NO_ERROR;
 }
 
 void

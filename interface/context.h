@@ -30,6 +30,10 @@ static struct buffer *context_import_buffer(struct wld_context *context, uint32_
 static struct wld_surface *context_create_surface(struct wld_context *context,
                                                   uint32_t width, uint32_t height, uint32_t format, uint32_t flags);
 #endif
+#ifdef CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
+static int context_query_modifiers(struct wld_context *context, uint32_t format,
+                                   uint64_t *modifiers, int max);
+#endif
 static void context_destroy(struct wld_context *context);
 
 static const struct wld_context_impl wld_context_impl = {
@@ -40,6 +44,11 @@ static const struct wld_context_impl wld_context_impl = {
 	.create_surface = &context_create_surface,
 #else
 	.create_surface = &default_create_surface,
+#endif
+#ifdef CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
+	.query_modifiers = &context_query_modifiers,
+#else
+	.query_modifiers = NULL,
 #endif
 	.destroy = &context_destroy
 };
