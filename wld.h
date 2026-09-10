@@ -62,6 +62,7 @@ enum wld_object_type {
 union wld_object {
 	void *ptr;
 	uint32_t u32;
+	uint64_t u64;
 	int i;
 };
 

@@ -69,6 +69,7 @@ struct gbm_context {
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture_2d;
 
 	bool has_modifiers;
+	bool has_unpack_subimage;
 };
 
 struct gbm_buffer {
@@ -90,6 +91,8 @@ struct gbm_buffer {
 	 * into an ordinary GL texture instead of being wrapped in an EGLImage.
 	 */
 	bool cpu;
+	bool dumb;
+	bool tex_allocated;
 	size_t mapping_size;
 	bool dirty;
 };
@@ -379,6 +382,12 @@ driver_create_context(int drm_fd)
 		goto error3;
 	}
 
+	{
+		const char *gl_ext = (const char *)glGetString(GL_EXTENSIONS);
+		context->has_unpack_subimage =
+		    has_extension(gl_ext, "GL_EXT_unpack_subimage");
+	}
+
 	context_initialize(&context->base, &wld_context_impl);
 	DEBUG("using GBM/EGL context (EGL %d.%d)\n", major, minor);
 
@@ -405,7 +414,14 @@ export(struct wld_exporter *exporter, struct wld_buffer *base,
 
 	switch (type) {
 	case WLD_DRM_OBJECT_HANDLE:
+		if (!buffer->handle)
+			return false;
 		object->u32 = buffer->handle;
+		return true;
+	case WLD_DRM_OBJECT_MODIFIER:
+		/* Dumb buffers are always linear. */
+		object->u64 = buffer->bo ? gbm_bo_get_modifier(buffer->bo)
+		                         : DRM_FORMAT_MOD_LINEAR;
 		return true;
 	case WLD_DRM_OBJECT_PRIME_FD:
 		if (buffer->bo) {
@@ -510,51 +526,78 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	 * compositor handles a client's shm buffer.
 	 */
 	if (flags & WLD_FLAG_MAP) {
-		struct drm_mode_create_dumb create_dumb = {
-			.height = height,
-			.width = width,
-			.bpp = format_bytes_per_pixel(format) * 8,
-		};
-		struct drm_mode_map_dumb map_dumb;
 		struct gbm_buffer *cpu_buffer;
+		uint32_t pitch = width * format_bytes_per_pixel(format);
 		void *data;
 
-		if (drmIoctl(context->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_dumb) != 0) {
-			DEBUG("DRM_IOCTL_MODE_CREATE_DUMB failed\n");
+		/*
+		 * Only the cursor plane needs a GEM handle, and a dumb buffer's
+		 * mapping is write-combined: reading 3MB back out of one to upload
+		 * it takes ~190ms, which is far slower than compositing. Everything
+		 * else gets ordinary cached memory, which the GPU reads at memcpy
+		 * speed. Cursors stay dumb and are small enough not to care.
+		 */
+		if (flags & WLD_FLAG_CURSOR) {
+			struct drm_mode_create_dumb create_dumb = {
+				.height = height,
+				.width = width,
+				.bpp = format_bytes_per_pixel(format) * 8,
+			};
+			struct drm_mode_map_dumb map_dumb;
+
+			if (drmIoctl(context->fd, DRM_IOCTL_MODE_CREATE_DUMB,
+			             &create_dumb) != 0) {
+				DEBUG("DRM_IOCTL_MODE_CREATE_DUMB failed\n");
+				return NULL;
+			}
+
+			map_dumb = (struct drm_mode_map_dumb){ .handle = create_dumb.handle };
+			if (drmIoctl(context->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
+				goto error_dumb;
+
+			data = mmap(NULL, create_dumb.size, PROT_READ | PROT_WRITE,
+			            MAP_SHARED, context->fd, map_dumb.offset);
+			if (data == MAP_FAILED)
+				goto error_dumb;
+
+			buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR,
+			                    create_dumb.handle, false, width, height,
+			                    format, create_dumb.pitch);
+			if (!buffer) {
+				munmap(data, create_dumb.size);
+				goto error_dumb;
+			}
+
+			cpu_buffer = gbm_buffer(&buffer->base);
+			cpu_buffer->dumb = true;
+			cpu_buffer->mapping_size = create_dumb.size;
+			goto cpu_done;
+
+		error_dumb: {
+			struct drm_mode_destroy_dumb destroy_dumb = {
+				.handle = create_dumb.handle
+			};
+			drmIoctl(context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+		}
 			return NULL;
 		}
 
-		map_dumb = (struct drm_mode_map_dumb){ .handle = create_dumb.handle };
-		if (drmIoctl(context->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
-			goto error_dumb;
+		if (!(data = calloc(height, pitch)))
+			return NULL;
 
-		data = mmap(NULL, create_dumb.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-		            context->fd, map_dumb.offset);
-		if (data == MAP_FAILED)
-			goto error_dumb;
-
-		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, create_dumb.handle,
-		                    false, width, height, format, create_dumb.pitch);
+		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, false, width,
+		                    height, format, pitch);
 		if (!buffer) {
-			munmap(data, create_dumb.size);
-			goto error_dumb;
+			free(data);
+			return NULL;
 		}
-
 		cpu_buffer = gbm_buffer(&buffer->base);
+
+	cpu_done:
 		cpu_buffer->cpu = true;
-		cpu_buffer->mapping_size = create_dumb.size;
 		cpu_buffer->dirty = true;
 		buffer->base.map = data;
-
 		return buffer;
-
-	error_dumb: {
-		struct drm_mode_destroy_dumb destroy_dumb = {
-			.handle = create_dumb.handle
-		};
-		drmIoctl(context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
-	}
-		return NULL;
 	}
 
 	if (flags & WLD_DRM_FLAG_SCANOUT)
@@ -718,14 +761,18 @@ buffer_destroy(struct buffer *base)
 		glDeleteTextures(1, &buffer->texture);
 
 	if (buffer->cpu) {
-		struct drm_mode_destroy_dumb destroy_dumb = {
-			.handle = buffer->handle
-		};
+		if (buffer->dumb) {
+			struct drm_mode_destroy_dumb destroy_dumb = {
+				.handle = buffer->handle
+			};
 
-		if (base->base.map)
-			munmap(base->base.map, buffer->mapping_size);
-		drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB,
-		         &destroy_dumb);
+			if (base->base.map)
+				munmap(base->base.map, buffer->mapping_size);
+			drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB,
+			         &destroy_dumb);
+		} else {
+			free(base->base.map);
+		}
 		free(buffer);
 		return;
 	}
@@ -770,36 +817,48 @@ buffer_texture(struct gbm_buffer *buffer)
 		}
 	}
 
-	/* Dumb-buffer contents live in system memory, so upload what changed. */
+	/* CPU-backed contents live in system memory and must be uploaded. */
 	if (buffer->cpu && (fresh || buffer->dirty)) {
+		uint32_t width = buffer->base.base.width;
+		uint32_t height = buffer->base.base.height;
+		uint32_t pitch = buffer->base.base.pitch;
+		uint32_t row_pixels = pitch / 4;
+
 		if (!buffer->base.base.map)
 			return 0;
 
 		glBindTexture(GL_TEXTURE_2D, buffer->texture);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-		/*
-		 * GLES2 has no GL_UNPACK_ROW_LENGTH, so a padded pitch cannot be
-		 * uploaded in one call. wld only ever hands us 4-byte pixels, and
-		 * dumb pitches are a multiple of that, so walk rows when padded.
-		 */
-		if (buffer->base.base.pitch == buffer->base.base.width * 4) {
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT,
-			             buffer->base.base.width, buffer->base.base.height, 0,
-			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, buffer->base.base.map);
+
+		/* Allocate storage once; refreshes are sub-image updates. */
+		if (!buffer->tex_allocated) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, width, height, 0,
+			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+			buffer->tex_allocated = true;
+		}
+
+		if (row_pixels == width) {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+			                buffer->base.base.map);
+		} else if (buffer->context->has_unpack_subimage) {
+			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+			                buffer->base.base.map);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
 		} else {
+			/* GLES2 without GL_EXT_unpack_subimage cannot skip padding. */
 			uint32_t y;
 
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT,
-			             buffer->base.base.width, buffer->base.base.height, 0,
-			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
-			for (y = 0; y < buffer->base.base.height; ++y) {
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y,
-				                buffer->base.base.width, 1, GL_BGRA_EXT,
+			for (y = 0; y < height; ++y) {
+				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_BGRA_EXT,
 				                GL_UNSIGNED_BYTE,
 				                (uint8_t *)buffer->base.base.map
-				                    + (size_t)y * buffer->base.base.pitch);
+				                    + (size_t)y * pitch);
 			}
 		}
+
 		buffer->dirty = false;
 	}
 

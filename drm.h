@@ -32,6 +32,14 @@
 enum wld_drm_object_type {
 	WLD_DRM_OBJECT_HANDLE = WLD_DRM_ID,
 	WLD_DRM_OBJECT_PRIME_FD,
+	/**
+	 * The buffer's DRM format modifier, as a uint64_t in object->u64.
+	 *
+	 * A caller building a KMS framebuffer needs this: a tiled buffer passed
+	 * to drmModeAddFB2() without DRM_MODE_FB_MODIFIERS is interpreted as
+	 * linear and rejected.
+	 */
+	WLD_DRM_OBJECT_MODIFIER,
 };
 
 enum wld_drm_flags {
