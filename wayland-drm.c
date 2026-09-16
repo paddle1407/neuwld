@@ -254,19 +254,29 @@ drm_device(void *data, struct wl_drm *wl, const char *name)
 {
 	struct drm_context *context = data;
 
-	context->fd = open(name, O_RDWR);
-	if (context->fd == -1) {
+	int fd;
+
+	if (context->fd != -1) {
+		/* Keep the device already opened; overwriting would leak its fd. */
+		return;
+	}
+	fd = open(name, O_RDWR);
+	if (fd == -1) {
 		DEBUG("Couldn't open DRM device '%s'\n", name);
 		return;
 	}
+	context->fd = fd;
 }
 
 void
 drm_format(void *data, struct wl_drm *wl, uint32_t format)
 {
 	struct drm_context *context = data;
+	uint32_t *entry = wl_array_add(&context->formats, sizeof format);
 
-	*((uint32_t *)wl_array_add(&context->formats, sizeof format)) = format;
+	if (entry) {
+		*entry = format;
+	}
 }
 
 void

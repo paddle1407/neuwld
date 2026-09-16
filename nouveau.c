@@ -426,7 +426,7 @@ context_import_buffer(struct wld_context *base,
 	return &buffer->base;
 
 error1:
-	nouveau_bo_ref(NULL, &buffer->bo);
+	nouveau_bo_ref(NULL, &bo);
 error0:
 	return NULL;
 }

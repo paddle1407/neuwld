@@ -23,6 +23,60 @@
 
 #include "wld-private.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+/* Opt-in lifetime accounting: RSS alone cannot distinguish leaked buffers
+ * from freed heap pages retained by malloc or allocations inside a driver.
+ * The byte count describes pixel layouts, not physical/GPU memory usage. */
+static int memory_profile_enabled = -1;
+static uint64_t live_buffers, live_pixel_bytes;
+
+static bool
+memory_profile(void)
+{
+	if (memory_profile_enabled < 0) {
+		const char *value = getenv("CHARAWC_DEBUG_MEMORY");
+		memory_profile_enabled = value && strcmp(value, "1") == 0;
+	}
+	return memory_profile_enabled;
+}
+
+static void
+log_buffer_memory(const char *event, uintptr_t address, uint32_t width,
+                  uint32_t height)
+{
+	fprintf(stderr, "memory-profile: pid=%ld buffer-%s=0x%" PRIxPTR
+	        " size=%ux%u live_buffers=%" PRIu64 " pixel_bytes=%" PRIu64,
+	        (long)getpid(), event, address, width, height, live_buffers,
+	        live_pixel_bytes);
+#ifdef __linux__
+	FILE *statm = fopen("/proc/self/statm", "r");
+	unsigned long pages, resident;
+	long page_size = sysconf(_SC_PAGESIZE);
+	if (statm) {
+		if (fscanf(statm, "%lu %lu", &pages, &resident) == 2 && page_size > 0)
+			fprintf(stderr, " rss_kib=%" PRIu64,
+			        (uint64_t)resident * page_size / 1024);
+		fclose(statm);
+	}
+#endif
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+	struct mallinfo2 heap = mallinfo2();
+	fprintf(stderr, " heap_used=%zu heap_free=%zu malloc_mmap=%zu",
+	        heap.uordblks, heap.fordblks, heap.hblkhd);
+#endif
+#endif
+	fputc('\n', stderr);
+}
+
 void
 buffer_initialize(struct buffer *buffer,
                   const struct wld_buffer_impl *impl,
@@ -40,6 +94,11 @@ buffer_initialize(struct buffer *buffer,
 	buffer->exporters = NULL;
 	buffer->destructors = NULL;
 	pixman_region32_init_rect(&buffer->base.damage, 0, 0, width, height);
+	if (memory_profile()) {
+		++live_buffers;
+		live_pixel_bytes += (uint64_t)pitch * height;
+		log_buffer_memory("create", (uintptr_t)buffer, width, height);
+	}
 }
 
 EXPORT
@@ -121,6 +180,8 @@ wld_buffer_unreference(struct wld_buffer *base)
 
 	if (--buffer->ref > 0)
 		return;
+	uintptr_t address = (uintptr_t)buffer;
+	uint32_t width = base->width, height = base->height, pitch = base->pitch;
 
 	pixman_region32_fini(&buffer->base.damage);
 
@@ -133,4 +194,9 @@ wld_buffer_unreference(struct wld_buffer *base)
 		buffer->base.impl->unmap(buffer);
 
 	buffer->base.impl->destroy(buffer);
+	if (memory_profile()) {
+		--live_buffers;
+		live_pixel_bytes -= (uint64_t)pitch * height;
+		log_buffer_memory("destroy", address, width, height);
+	}
 }

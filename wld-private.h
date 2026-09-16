@@ -57,6 +57,7 @@ struct wld_font_context {
 
 struct glyph {
 	FT_Bitmap bitmap;
+	uint64_t serial; /* Identifies this allocation across font reloads. */
 
 	/**
 	 * The offset from the origin to the top left corner of the bitmap.
@@ -140,6 +141,12 @@ struct wld_renderer_impl {
 	bool (*read_pixels)(struct wld_renderer *renderer, int32_t x, int32_t y,
 	                    uint32_t width, uint32_t height, uint32_t pitch,
 	                    void *data);
+	/**
+	 * Optional. Orders subsequent rendering after a DRM sync_file fence,
+	 * without consuming the caller's file descriptor. A negative fence_fd
+	 * only probes support. NULL when the backend has no notion of fences.
+	 */
+	bool (*wait_fence)(struct wld_renderer *renderer, int fence_fd);
 	void (*destroy)(struct wld_renderer *renderer);
 };
 

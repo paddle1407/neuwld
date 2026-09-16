@@ -80,6 +80,16 @@ wld_capabilities(struct wld_renderer *renderer, struct wld_buffer *buffer)
 
 EXPORT
 bool
+wld_wait_fence(struct wld_renderer *renderer, int fence_fd)
+{
+	if (!renderer->impl->wait_fence)
+		return false;
+
+	return renderer->impl->wait_fence(renderer, fence_fd);
+}
+
+EXPORT
+bool
 wld_set_target_buffer(struct wld_renderer *renderer, struct wld_buffer *buffer)
 {
 	if (!renderer->impl->set_target(renderer, (struct buffer *)buffer))

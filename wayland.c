@@ -97,25 +97,29 @@ wld_wayland_create_context(struct wl_display *display, enum wld_wayland_interfac
 	if ((interface_string = getenv("WLD_WAYLAND_INTERFACE"))) {
 		id = interface_id(interface_string);
 
-		if ((context = impls[id]->create_context(display, queue)))
-			return &context->base;
+		if (id >= 0 && (size_t)id < ARRAY_LENGTH(impls) && impls[id] &&
+		    (context = impls[id]->create_context(display, queue)))
+			goto done;
 
 		fprintf(stderr, "Could not create context for Wayland interface '%s'\n",
 		        interface_string);
 
+		/* L5: nothing owns the queue until a context takes it. */
+		wl_event_queue_destroy(queue);
 		return NULL;
 	}
 
 	va_start(requested_impls, id);
 
 	while (id >= 0) {
-		if (impls_tried[id] || !impls[id])
-			continue;
+		if ((size_t)id < ARRAY_LENGTH(impls) && impls[id] && !impls_tried[id]) {
+			if ((context = impls[id]->create_context(display, queue))) {
+				va_end(requested_impls);
+				goto done;
+			}
 
-		if ((context = impls[id]->create_context(display, queue)))
-			goto done;
-
-		impls_tried[id] = true;
+			impls_tried[id] = true;
+		}
 		id = va_arg(requested_impls, enum wld_wayland_interface_id);
 	}
 
@@ -134,6 +138,7 @@ wld_wayland_create_context(struct wl_display *display, enum wld_wayland_interfac
 
 	if (!context) {
 		DEBUG("Could not initialize any of the specified implementations\n");
+		wl_event_queue_destroy(queue);
 		return NULL;
 	}
 

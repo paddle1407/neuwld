@@ -190,7 +190,7 @@ context_destroy(struct wld_context *base)
 {
 	struct dumb_context *context = dumb_context(base);
 
-	close(context->fd);
+	/* The fd belongs to the caller of wld_drm_create_context. */
 	free(context);
 }
 

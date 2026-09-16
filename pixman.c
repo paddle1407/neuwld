@@ -422,6 +422,10 @@ renderer_draw_text(struct wld_renderer *base,
 	if (!glyphs)
 		return;
 	solid = pixman_image_create_solid_fill(&pixman_color);
+	if (!solid) {
+		free(glyphs);
+		return;
+	}
 
 	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0 && c != '\0') {
 		text += ret;
@@ -432,11 +436,15 @@ renderer_draw_text(struct wld_renderer *base,
 			continue;
 
 		glyph = font->glyphs[glyph_index];
+		/* Opaque cache keys must survive font/glyph address reuse. Split the
+		 * allocation serial so this also works with 32-bit pointer keys. */
+		const void *font_key = (void *)(uintptr_t)(glyph->serial >> 32);
+		const void *glyph_key = (void *)(uintptr_t)(uint32_t)glyph->serial;
 
 		glyphs[index].x = origin_x;
 		glyphs[index].y = 0;
 		glyphs[index].glyph = pixman_glyph_cache_lookup(renderer->glyph_cache,
-		                                                font, glyph);
+		                                                font_key, glyph_key);
 
 		/* If we don't have the glyph in our cache, do some conversions to make
 		 * pixman happy, and then insert it. */
@@ -449,7 +457,7 @@ renderer_draw_text(struct wld_renderer *base,
 
 			/* Insert the glyph into the cache. */
 			pixman_glyph_cache_freeze(renderer->glyph_cache);
-			glyphs[index].glyph = pixman_glyph_cache_insert(renderer->glyph_cache, font, glyph,
+			glyphs[index].glyph = pixman_glyph_cache_insert(renderer->glyph_cache, font_key, glyph_key,
 			                                                -glyph->x, -glyph->y, image);
 			pixman_glyph_cache_thaw(renderer->glyph_cache);
 

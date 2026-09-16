@@ -24,6 +24,9 @@
 #include "wld-private.h"
 
 #include <fontconfig/fcfreetype.h>
+#include <math.h>
+
+static uint64_t next_glyph_serial;
 
 EXPORT
 struct wld_font_context *
@@ -68,15 +71,19 @@ wld_font_open_name(struct wld_font_context *context, const char *name)
 	DEBUG("Opening font with name: %s\n", name);
 
 	pattern = FcNameParse((const FcChar8 *)name);
+	if (!pattern) return NULL;
 	FcConfigSubstitute(NULL, pattern, FcMatchPattern);
 	FcDefaultSubstitute(pattern);
 
 	match = FcFontMatch(NULL, pattern, &result);
+	FcPatternDestroy(pattern);
 
 	if (!match)
 		return NULL;
 
-	return wld_font_open_pattern(context, match);
+	struct wld_font *font = wld_font_open_pattern(context, match);
+	FcPatternDestroy(match);
+	return font;
 }
 
 EXPORT
@@ -86,7 +93,7 @@ wld_font_open_pattern(struct wld_font_context *context, FcPattern *match)
 	char *filename;
 	struct font *font;
 	FcResult result;
-	double pixel_size, aspect;
+	double pixel_size = 12, aspect = 1;
 
 	font = malloc(sizeof *font);
 
@@ -114,6 +121,7 @@ wld_font_open_pattern(struct wld_font_context *context, FcPattern *match)
 		DEBUG("Couldn't determine font filename or FreeType face\n");
 		goto error1;
 	}
+	if (FT_Reference_Face(font->face) != 0) goto error1;
 
 load_face:
 	result = FcPatternGetDouble(match, FC_PIXEL_SIZE, 0, &pixel_size);
@@ -122,6 +130,9 @@ load_face:
 
 	if (result == FcResultNoMatch)
 		aspect = 1.0;
+	if (!isfinite(pixel_size) || !isfinite(aspect) || pixel_size <= 0 ||
+	    aspect <= 0 || pixel_size > 4096 || pixel_size * aspect > 4096)
+		goto error_face;
 
 	if (font->face->face_flags & FT_FACE_FLAG_SCALABLE) {
 		FT_F26Dot6 width, height;
@@ -129,10 +140,10 @@ load_face:
 		width = ((unsigned int)pixel_size) << 6;
 		height = ((unsigned int)(pixel_size * aspect)) << 6;
 
-		FT_Set_Char_Size(font->face, width, height, 0, 0);
+		if (FT_Set_Char_Size(font->face, width, height, 0, 0) != 0) goto error_face;
 	} else {
-		FT_Set_Pixel_Sizes(font->face, (unsigned int)pixel_size,
-		                   (unsigned int)(pixel_size * aspect));
+		if (FT_Set_Pixel_Sizes(font->face, (unsigned int)pixel_size,
+		                      (unsigned int)(pixel_size * aspect)) != 0) goto error_face;
 	}
 
 	font->base.ascent = font->face->size->metrics.ascender >> 6;
@@ -141,9 +152,12 @@ load_face:
 	font->base.max_advance = font->face->size->metrics.max_advance >> 6;
 
 	font->glyphs = calloc(font->face->num_glyphs, sizeof(struct glyph *));
+	if (!font->glyphs) goto error_face;
 
 	return &font->base;
 
+error_face:
+	FT_Done_Face(font->face);
 error1:
 	free(font);
 error0:
@@ -156,6 +170,13 @@ wld_font_close(struct wld_font *font_base)
 {
 	struct font *font = (void *)font_base;
 
+	for (FT_Long i = 0; i < font->face->num_glyphs; ++i) {
+		struct glyph *glyph = font->glyphs[i];
+		if (!glyph) continue;
+		FT_Bitmap_Done(font->context->library, &glyph->bitmap);
+		free(glyph);
+	}
+	free(font->glyphs);
 	FT_Done_Face(font->face);
 	free(font);
 }
@@ -172,13 +193,19 @@ font_ensure_glyph(struct font *font, FT_UInt glyph_index)
 			if (!glyph)
 				return false;
 
-			FT_Load_Glyph(font->face, glyph_index,
-			              FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL);
+			if (FT_Load_Glyph(font->face, glyph_index,
+			                  FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0) {
+				free(glyph); return false;
+			}
 
 			FT_Bitmap_New(&glyph->bitmap);
 
-			FT_Bitmap_Copy(font->context->library,
-			               &font->face->glyph->bitmap, &glyph->bitmap);
+			if (FT_Bitmap_Copy(font->context->library,
+			                   &font->face->glyph->bitmap, &glyph->bitmap) != 0) {
+				FT_Bitmap_Done(font->context->library, &glyph->bitmap);
+				free(glyph); return false;
+			}
+			glyph->serial = ++next_glyph_serial;
 
 			glyph->advance = font->face->glyph->metrics.horiAdvance >> 6;
 			glyph->x = font->face->glyph->bitmap_left;

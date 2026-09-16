@@ -58,6 +58,9 @@ static bool renderer_read_pixels(struct wld_renderer *renderer, int32_t x,
                                  int32_t y, uint32_t width, uint32_t height,
                                  uint32_t pitch, void *data);
 #endif
+#ifdef RENDERER_IMPLEMENTS_WAIT_FENCE
+static bool renderer_wait_fence(struct wld_renderer *renderer, int fence_fd);
+#endif
 static void renderer_flush(struct wld_renderer *renderer);
 static void renderer_destroy(struct wld_renderer *renderer);
 
@@ -86,6 +89,11 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 	.read_pixels = &renderer_read_pixels,
 #else
 	.read_pixels = NULL,
+#endif
+#ifdef RENDERER_IMPLEMENTS_WAIT_FENCE
+	.wait_fence = &renderer_wait_fence,
+#else
+	.wait_fence = NULL,
 #endif
 	.destroy = &renderer_destroy
 };

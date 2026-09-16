@@ -74,8 +74,10 @@ create_driver_context(int fd)
 			continue;
 
 		DEBUG("Trying DRM driver `%s'\n", drivers[index]->name);
-		if ((context = drivers[index]->create_context(fd)))
+		if ((context = drivers[index]->create_context(fd))) {
+			fprintf(stderr, "wld: selected DRM backend %s\n", drivers[index]->name);
 			break;
+		}
 
 		DEBUG("DRM driver `%s' did not take the device\n",
 		      drivers[index]->name);
@@ -99,6 +101,7 @@ wld_drm_create_context(int fd)
 	}
 
 	DEBUG("Falling back to dumb DRM driver\n");
+	fprintf(stderr, "wld: falling back to software dumb DRM backend\n");
 	return dumb_drm_driver.create_context(fd);
 }
 

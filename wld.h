@@ -268,6 +268,24 @@ void wld_blend_region(struct wld_renderer *renderer,
                       int32_t dst_x, int32_t dst_y,
                       pixman_region32_t *region);
 
+/**
+ * Order subsequent rendering after a DRM sync_file fence.
+ *
+ * A client using explicit synchronization hands the compositor a fence instead
+ * of relying on the kernel to order access to the buffer implicitly. Drivers
+ * that do not participate in implicit synchronization -- the NVIDIA proprietary
+ * driver among them -- give no other way to know that a client has finished
+ * drawing into a buffer before it is sampled.
+ *
+ * The fence is not consumed: the caller keeps ownership of fence_fd and must
+ * close it. A negative fence_fd probes whether the backend can wait on fences
+ * at all, without waiting on anything.
+ *
+ * Returns false if the backend cannot wait on fences, or if this fence could
+ * not be waited on.
+ */
+bool wld_wait_fence(struct wld_renderer *renderer, int fence_fd);
+
 void wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
 				int32_t x, int32_t y, uint32_t r, bool fill);
 

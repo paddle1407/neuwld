@@ -29,6 +29,8 @@
  * SOFTWARE.
  */
 
+#define _DEFAULT_SOURCE 1
+
 #include "drm-private.h"
 #include "drm.h"
 #include "wld-private.h"
@@ -37,8 +39,13 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <poll.h>
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <drm_fourcc.h>
 #include <gbm.h>
 #include <stdlib.h>
@@ -48,11 +55,21 @@
 
 #include <fontconfig/fontconfig.h>
 
+/*
+ * How long a direct wait on a fence descriptor may block. A client that
+ * never signals must not wedge the caller; one frame at 60Hz is 16ms.
+ */
+#define FENCE_WAIT_MS 50
+
 /* Number of glyph textures cached per renderer. */
 #define GLYPH_CACHE_SIZE 512
 
+/* Keep window-sized CPU pixel storage out of malloc's retained heap arenas.
+ * Small images still use calloc to avoid a mapping/page per tiny asset. */
+#define PIXEL_MAPPING_THRESHOLD (256u * 1024u)
+
 struct glyph_entry {
-	struct glyph *glyph;
+	uint64_t serial;
 	GLuint texture;
 	uint32_t width, height;
 };
@@ -68,9 +85,14 @@ struct gbm_context {
 	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture_2d;
 	PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dmabuf_modifiers;
+	PFNEGLCREATESYNCKHRPROC create_sync;
+	PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+	PFNEGLWAITSYNCKHRPROC wait_sync;
 
 	bool has_modifiers;
 	bool has_unpack_subimage;
+	/* Set when a client's DRM sync_file fence can be waited on by the GPU. */
+	bool has_fence_sync;
 };
 
 struct gbm_buffer {
@@ -87,7 +109,16 @@ struct gbm_buffer {
 	void *map_data;
 
 	/*
-	 * WLD_FLAG_MAP buffers are backed by a DRM dumb buffer rather than GBM.
+	 * An imported buffer has no gbm_bo to ask for its layout, so keep the
+	 * modifier the client declared. Reporting LINEAR for a tiled import
+	 * would build a DRM framebuffer that scans out garbage. Buffers we
+	 * allocate without a bo are linear dumb buffers, and calloc already
+	 * leaves this at DRM_FORMAT_MOD_LINEAR (0) for them.
+	 */
+	uint64_t modifier;
+
+	/*
+	 * WLD_FLAG_MAP buffers use cached CPU memory (DRM dumb for cursors).
 	 * NVIDIA will not sample or render a linear dmabuf, so these are uploaded
 	 * into an ordinary GL texture instead of being wrapped in an EGLImage.
 	 */
@@ -128,6 +159,7 @@ struct gles_renderer {
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
 #define RENDERER_IMPLEMENTS_READ_PIXELS
+#define RENDERER_IMPLEMENTS_WAIT_FENCE
 #include "interface/buffer.h"
 #include "interface/context.h"
 #include "interface/renderer.h"
@@ -259,7 +291,11 @@ driver_device_supported(uint32_t vendor_id, uint32_t device_id)
 	 * Claim everything and let driver_create_context() fail if the stack
 	 * is not actually usable; drm.c then falls through to the dumb driver.
 	 */
-	return !getenv("WLD_DRM_NO_GBM");
+	if (getenv("WLD_DRM_NO_GBM")) {
+		fprintf(stderr, "wld: GBM backend disabled by WLD_DRM_NO_GBM\n");
+		return false;
+	}
+	return true;
 }
 
 static bool
@@ -280,6 +316,32 @@ has_extension(const char *extensions, const char *extension)
 	}
 
 	return false;
+}
+
+static EGLDisplay
+gbm_egl_display(struct gbm_device *device)
+{
+	const char *extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+	bool khr = has_extension(extensions, "EGL_KHR_platform_gbm");
+	bool mesa = has_extension(extensions, "EGL_MESA_platform_gbm");
+
+	/* A gbm_device is not an X display or a wl_display. The legacy
+	 * eglGetDisplay API leaves native-platform detection to the EGL loader
+	 * (and environment); request GBM explicitly for multi-vendor systems. */
+	if (khr) {
+		PFNEGLGETPLATFORMDISPLAYPROC get_display =
+		    (PFNEGLGETPLATFORMDISPLAYPROC)eglGetProcAddress("eglGetPlatformDisplay");
+		if (get_display)
+			return get_display(EGL_PLATFORM_GBM_KHR, device, NULL);
+	}
+	if ((khr || mesa) && has_extension(extensions, "EGL_EXT_platform_base")) {
+		PFNEGLGETPLATFORMDISPLAYEXTPROC get_display =
+		    (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+		if (get_display)
+			return get_display(EGL_PLATFORM_GBM_KHR, device, NULL);
+	}
+	fprintf(stderr, "wld: GBM initialization failed: EGL has no GBM platform entry point\n");
+	return EGL_NO_DISPLAY;
 }
 
 struct wld_context *
@@ -306,32 +368,32 @@ driver_create_context(int drm_fd)
 	context->fd = drm_fd;
 
 	if (!(context->gbm = gbm_create_device(drm_fd))) {
-		DEBUG("gbm_create_device failed\n");
+		fprintf(stderr, "wld: gbm_create_device failed: %s\n", strerror(errno));
 		goto error0;
 	}
 
-	context->display = eglGetDisplay((EGLNativeDisplayType)context->gbm);
+	context->display = gbm_egl_display(context->gbm);
 	if (context->display == EGL_NO_DISPLAY) {
-		DEBUG("eglGetDisplay failed\n");
+		fprintf(stderr, "wld: GBM platform display failed (EGL error 0x%x)\n", eglGetError());
 		goto error1;
 	}
 
 	if (!eglInitialize(context->display, &major, &minor)) {
-		DEBUG("eglInitialize failed\n");
+		fprintf(stderr, "wld: GBM eglInitialize failed (EGL error 0x%x)\n", eglGetError());
 		goto error1;
 	}
 
 	extensions = eglQueryString(context->display, EGL_EXTENSIONS);
 	if (!has_extension(extensions, "EGL_KHR_image_base")
 	    || !has_extension(extensions, "EGL_EXT_image_dma_buf_import")) {
-		DEBUG("required EGL image extensions missing\n");
+		fprintf(stderr, "wld: GBM initialization failed: required EGL image extensions missing\n");
 		goto error2;
 	}
 	context->has_modifiers =
 	    has_extension(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		DEBUG("eglBindAPI failed\n");
+		fprintf(stderr, "wld: GBM eglBindAPI failed (EGL error 0x%x)\n", eglGetError());
 		goto error2;
 	}
 
@@ -341,7 +403,7 @@ driver_create_context(int drm_fd)
 	 * enough.
 	 */
 	if (!has_extension(extensions, "EGL_KHR_surfaceless_context")) {
-		DEBUG("EGL_KHR_surfaceless_context missing\n");
+		fprintf(stderr, "wld: GBM initialization failed: EGL_KHR_surfaceless_context missing\n");
 		goto error2;
 	}
 
@@ -354,7 +416,7 @@ driver_create_context(int drm_fd)
 		if (!eglChooseConfig(context->display, config_attribs, &config, 1,
 		                     &num_configs)
 		    || num_configs == 0) {
-			DEBUG("eglChooseConfig found no usable config\n");
+			fprintf(stderr, "wld: GBM eglChooseConfig found no usable config (EGL error 0x%x)\n", eglGetError());
 			goto error2;
 		}
 	}
@@ -362,13 +424,13 @@ driver_create_context(int drm_fd)
 	context->context = eglCreateContext(context->display, config,
 	                                    EGL_NO_CONTEXT, context_attribs);
 	if (context->context == EGL_NO_CONTEXT) {
-		DEBUG("eglCreateContext failed\n");
+		fprintf(stderr, "wld: GBM eglCreateContext failed (EGL error 0x%x)\n", eglGetError());
 		goto error2;
 	}
 
 	if (!eglMakeCurrent(context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
 	                    context->context)) {
-		DEBUG("eglMakeCurrent failed\n");
+		fprintf(stderr, "wld: GBM eglMakeCurrent failed (EGL error 0x%x)\n", eglGetError());
 		goto error3;
 	}
 
@@ -381,9 +443,31 @@ driver_create_context(int drm_fd)
 	context->query_dmabuf_modifiers = (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)
 	    eglGetProcAddress("eglQueryDmaBufModifiersEXT");
 
+	/*
+	 * Explicit synchronization: turn a client's sync_file into an EGLSync the
+	 * GPU can wait on, so composition is ordered after the client's rendering
+	 * on drivers that do not provide implicit fences for dmabufs.
+	 */
+	if (has_extension(extensions, "EGL_KHR_fence_sync")
+	    && has_extension(extensions, "EGL_ANDROID_native_fence_sync")
+	    && has_extension(extensions, "EGL_KHR_wait_sync")) {
+		context->create_sync =
+		    (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+		context->destroy_sync =
+		    (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+		context->wait_sync =
+		    (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
+		context->has_fence_sync = context->create_sync
+		    && context->destroy_sync && context->wait_sync;
+	}
+	if (!context->has_fence_sync) {
+		fprintf(stderr, "wld: GBM has no EGL fence sync; explicit client "
+		                "synchronization is unavailable\n");
+	}
+
 	if (!context->create_image || !context->destroy_image
 	    || !context->image_target_texture_2d) {
-		DEBUG("required EGL/GL entry points missing\n");
+		fprintf(stderr, "wld: GBM initialization failed: required EGL/GL entry points missing\n");
 		goto error3;
 	}
 
@@ -395,6 +479,9 @@ driver_create_context(int drm_fd)
 
 	context_initialize(&context->base, &wld_context_impl);
 	DEBUG("using GBM/EGL context (EGL %d.%d)\n", major, minor);
+	fprintf(stderr, "wld: EGL %d.%d, GL renderer: %s, vendor: %s\n",
+	        major, minor, (const char *)glGetString(GL_RENDERER),
+	        (const char *)glGetString(GL_VENDOR));
 
 	return &context->base;
 
@@ -424,9 +511,15 @@ export(struct wld_exporter *exporter, struct wld_buffer *base,
 		object->u32 = buffer->handle;
 		return true;
 	case WLD_DRM_OBJECT_MODIFIER:
-		/* Dumb buffers are always linear. */
-		object->u64 = buffer->bo ? gbm_bo_get_modifier(buffer->bo)
-		                         : DRM_FORMAT_MOD_LINEAR;
+		if (buffer->bo) {
+			object->u64 = gbm_bo_get_modifier(buffer->bo);
+			return true;
+		}
+		/* An import keeps the layout it was given; anything else we
+		 * allocated ourselves without a bo is a linear dumb buffer. */
+		object->u64 = buffer->modifier != DRM_FORMAT_MOD_INVALID
+		                  ? buffer->modifier
+		                  : DRM_FORMAT_MOD_LINEAR;
 		return true;
 	case WLD_DRM_OBJECT_PRIME_FD:
 		if (buffer->bo) {
@@ -532,7 +625,14 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	 */
 	if (flags & WLD_FLAG_MAP) {
 		struct gbm_buffer *cpu_buffer;
-		uint32_t pitch = width * format_bytes_per_pixel(format);
+		uint32_t bytes_per_pixel = format_bytes_per_pixel(format);
+		if (!width || !height || !bytes_per_pixel ||
+		    width > UINT32_MAX / bytes_per_pixel)
+			return NULL;
+		uint32_t pitch = width * bytes_per_pixel;
+		if (height > SIZE_MAX / pitch)
+			return NULL;
+		size_t size = (size_t)height * pitch;
 		void *data;
 
 		/*
@@ -587,16 +687,27 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 			return NULL;
 		}
 
-		if (!(data = calloc(height, pitch)))
+		bool mapped = size >= PIXEL_MAPPING_THRESHOLD;
+		if (mapped) {
+			/* Anonymous mappings are zero-filled, cached RAM just like calloc,
+			 * but munmap returns their pages even when small heap objects live
+			 * longer than the terminal's upload buffer. */
+			data = mmap(NULL, size, PROT_READ | PROT_WRITE,
+			            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (data == MAP_FAILED) return NULL;
+		} else if (!(data = calloc(height, pitch))) {
 			return NULL;
+		}
 
 		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, false, width,
 		                    height, format, pitch);
 		if (!buffer) {
-			free(data);
+			if (mapped) munmap(data, size);
+			else free(data);
 			return NULL;
 		}
 		cpu_buffer = gbm_buffer(&buffer->base);
+		cpu_buffer->mapping_size = mapped ? size : 0;
 
 	cpu_done:
 		cpu_buffer->cpu = true;
@@ -686,8 +797,15 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 	                    height, format, pitch);
 	if (!buffer) {
 		context->destroy_image(context->display, image);
+		/* new_buffer took no ownership, so the handle is still ours. */
+		if (handle) {
+			struct drm_gem_close close_arg = { .handle = handle };
+			drmIoctl(context->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+		}
 		return NULL;
 	}
+
+	gbm_buffer(&buffer->base)->modifier = modifier;
 
 	return buffer;
 }
@@ -697,27 +815,41 @@ context_query_modifiers(struct wld_context *base, uint32_t format,
                         uint64_t *modifiers, int max)
 {
 	struct gbm_context *context = gbm_context(base);
-	EGLint count = 0;
+	EGLint count = 0, capacity;
+	EGLuint64KHR *available;
+	EGLBoolean *external_only;
+	int written = 0;
 
 	if (!context->query_dmabuf_modifiers || !context->has_modifiers)
 		return -1;
-
+	if (max <= 0)
+		return 0;
 	if (!context->query_dmabuf_modifiers(context->display, format, 0, NULL, NULL,
-	                                     &count)) {
+	                                     &count))
 		return -1;
-	}
-	if (count > max)
-		count = max;
 	if (count <= 0)
 		return 0;
-
-	if (!context->query_dmabuf_modifiers(context->display, format, count,
-	                                     (EGLuint64KHR *)modifiers, NULL,
-	                                     &count)) {
-		return -1;
+	capacity = count;
+	available = calloc(capacity, sizeof(*available));
+	external_only = calloc(capacity, sizeof(*external_only));
+	if (!available || !external_only) {
+		written = -1;
+		goto done;
 	}
-
-	return count;
+	if (!context->query_dmabuf_modifiers(context->display, format, capacity,
+	                                     available, external_only, &count)) {
+		written = -1;
+		goto done;
+	}
+	/* Our shaders sample GL_TEXTURE_2D, not GL_TEXTURE_EXTERNAL_OES. */
+	for (int i = 0; i < count && i < capacity && written < max; ++i) {
+		if (!external_only[i])
+			modifiers[written++] = available[i];
+	}
+done:
+	free(external_only);
+	free(available);
+	return written;
 }
 
 void
@@ -730,7 +862,8 @@ context_destroy(struct wld_context *base)
 	eglDestroyContext(context->display, context->context);
 	eglTerminate(context->display);
 	gbm_device_destroy(context->gbm);
-	close(context->fd);
+	/* The fd belongs to the caller of wld_drm_create_context, which closes
+	 * it itself; closing it here would close it twice. */
 	free(context);
 }
 
@@ -821,6 +954,8 @@ buffer_destroy(struct buffer *base)
 				munmap(base->base.map, buffer->mapping_size);
 			drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB,
 			         &destroy_dumb);
+		} else if (buffer->mapping_size) {
+			munmap(base->base.map, buffer->mapping_size);
 		} else {
 			free(base->base.map);
 		}
@@ -1162,8 +1297,8 @@ renderer_blend_region(struct wld_renderer *base, struct buffer *src,
 
 /*
  * Glyphs are cached as individual GL_ALPHA textures in a small direct-mapped
- * table. Freetype hands us the same stable struct glyph * for a given glyph,
- * so the pointer is the key.
+ * table. Allocation serials avoid stale cache hits when a font is closed and
+ * a later font's glyph reuses the same address.
  */
 static struct glyph_entry *
 glyph_texture(struct gles_renderer *renderer, struct glyph *glyph)
@@ -1174,15 +1309,15 @@ glyph_texture(struct gles_renderer *renderer, struct glyph *glyph)
 	uint32_t row, col;
 	size_t index;
 
-	index = ((uintptr_t)glyph >> 4) % GLYPH_CACHE_SIZE;
+	index = glyph->serial % GLYPH_CACHE_SIZE;
 	entry = &renderer->glyphs[index];
 
-	if (entry->glyph == glyph)
+	if (entry->serial == glyph->serial)
 		return entry->texture ? entry : NULL;
 
 	if (entry->texture)
 		glDeleteTextures(1, &entry->texture);
-	entry->glyph = glyph;
+	entry->serial = glyph->serial;
 	entry->texture = 0;
 	entry->width = bitmap->width;
 	entry->height = bitmap->rows;
@@ -1295,12 +1430,15 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
                      void *data)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
-	uint32_t row_bytes = width * 4;
+	uint64_t row_bytes = (uint64_t)width * 4;
 
-	if (!renderer->target_texture)
+	if (!renderer->target_texture || !data || x < 0 || y < 0 ||
+	    width == 0 || height == 0 || pitch < row_bytes ||
+	    (uint64_t)x + width > renderer->target_width ||
+	    (uint64_t)y + height > renderer->target_height)
 		return false;
 
-	glFinish();
+	/* Client-memory glReadPixels completes the read before returning. */
 
 	/*
 	 * GLES2 has no GL_PACK_ROW_LENGTH, so a destination with padding has to
@@ -1319,6 +1457,183 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
 	}
 
 	return glGetError() == GL_NO_ERROR;
+}
+
+/*
+ * How this driver behaves around fence synchronization, learned on the first
+ * fence rather than assumed.
+ *
+ * Two things vary, and the NVIDIA driver gets both wrong in ways that matter:
+ *
+ *  - Ownership of the descriptor handed to eglCreateSyncKHR.
+ *    EGL_ANDROID_native_fence_sync says the implementation takes it when the
+ *    call succeeds and closes it with the sync object. Closing it ourselves
+ *    against a driver that does that is a double close of a descriptor number
+ *    the driver may have reused, so we have to know rather than guess.
+ *
+ *  - Whether the GPU-side wait leaks. On this driver eglWaitSyncKHR leaks one
+ *    sync_file descriptor per call, permanently: create and destroy alone
+ *    balance, and adding the wait costs exactly one descriptor every time.
+ *    At one synchronized commit per client frame that exhausts a compositor's
+ *    descriptor table in minutes, and everything downstream of a descriptor
+ *    then fails at once -- clients cannot send buffers, and this function
+ *    stops working, which removes the very wait it exists to perform.
+ *
+ * So run one full create/wait/destroy cycle with both questions instrumented,
+ * and act on the answers from then on. Where the wait leaks, fall back to
+ * waiting on the descriptor itself: a sync_file becomes readable when its
+ * fence signals, so poll() is an exact wait for the same event. It blocks the
+ * caller rather than only ordering GPU commands, which is a real cost, but by
+ * the time a compositor composites a frame the client's rendering is normally
+ * already complete and the wait returns at once.
+ */
+enum fence_fd_ownership {
+	FENCE_FD_UNKNOWN,
+	FENCE_FD_CONSUMED, /* the driver closed it; it is not ours to close */
+	FENCE_FD_RETAINED, /* the driver left it open; we still own it */
+};
+
+static enum fence_fd_ownership fence_fd_ownership;
+static bool gpu_wait_leaks;
+static bool fence_behavior_known;
+
+/*
+ * How many descriptors the process has open, or -1 where that cannot be asked.
+ *
+ * Counting is the only reliable way to see this leak: the descriptor the
+ * driver keeps lands in the slot the descriptor it consumed just vacated, so
+ * the lowest free number does not move even though one was kept.
+ */
+static int
+count_open_fds(void)
+{
+#ifdef __linux__
+	DIR *dir = opendir("/proc/self/fd");
+	struct dirent *entry;
+	int total = 0;
+
+	if (!dir)
+		return -1;
+	while ((entry = readdir(dir))) {
+		if (entry->d_name[0] != '.')
+			++total;
+	}
+	closedir(dir);
+	/* The walk listed the descriptor it was walking with. */
+	return total > 0 ? total - 1 : 0;
+#else
+	return -1;
+#endif
+}
+
+static bool
+same_open_file(int fd, const struct stat *before)
+{
+	struct stat now;
+
+	return fstat(fd, &now) == 0 && now.st_dev == before->st_dev
+	       && now.st_ino == before->st_ino;
+}
+
+/* A sync_file signals by becoming readable. */
+static bool
+wait_fence_fd(int fence_fd)
+{
+	struct pollfd pollfd = {.fd = fence_fd, .events = POLLIN};
+	int ret;
+
+	do {
+		ret = poll(&pollfd, 1, FENCE_WAIT_MS);
+	} while (ret < 0 && errno == EINTR);
+
+	/* A fence that never signals must not wedge the caller for good. */
+	return ret > 0;
+}
+
+bool
+renderer_wait_fence(struct wld_renderer *base, int fence_fd)
+{
+	struct gles_renderer *renderer = gles_renderer(base);
+	struct gbm_context *context = renderer->context;
+	EGLSyncKHR sync;
+	EGLint attribs[3];
+	struct stat identity;
+	bool probing, probe_identity, waited;
+	int dup_fd, open_before = -1;
+
+	if (!context->has_fence_sync)
+		return false;
+
+	/* A negative descriptor only asks whether fences are supported. */
+	if (fence_fd < 0)
+		return true;
+
+	if (gpu_wait_leaks)
+		return wait_fence_fd(fence_fd);
+
+	probing = !fence_behavior_known;
+	/* Counted before our own duplicate exists, and compared after it is gone
+	 * again, so only what the driver kept is left in the difference. */
+	if (probing)
+		open_before = count_open_fds();
+
+	/* The caller keeps its own descriptor whatever the driver does with ours. */
+	if ((dup_fd = fcntl(fence_fd, F_DUPFD_CLOEXEC, 0)) < 0)
+		return false;
+
+	probe_identity = probing && fstat(dup_fd, &identity) == 0;
+
+	attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
+	attribs[1] = dup_fd;
+	attribs[2] = EGL_NONE;
+
+	sync = context->create_sync(context->display,
+	                            EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+	if (sync == EGL_NO_SYNC_KHR) {
+		/* Ownership only ever transfers on success, so this one is ours. */
+		close(dup_fd);
+		return false;
+	}
+
+	/*
+	 * Wait on the GPU rather than the CPU where that works: it only orders the
+	 * commands queued after it, and never blocks the caller on a client that
+	 * is slow to finish drawing.
+	 */
+	waited = context->wait_sync(context->display, sync, 0);
+	context->destroy_sync(context->display, sync);
+
+	if (probing) {
+		int open_after;
+
+		if (probe_identity) {
+			fence_fd_ownership = same_open_file(dup_fd, &identity)
+			                         ? FENCE_FD_RETAINED
+			                         : FENCE_FD_CONSUMED;
+		}
+		/* Take our own descriptor back first, so it is not mistaken for one
+		 * the driver kept. */
+		if (fence_fd_ownership == FENCE_FD_RETAINED)
+			close(dup_fd);
+
+		open_after = count_open_fds();
+		if (open_before >= 0 && open_after > open_before) {
+			gpu_wait_leaks = true;
+			fprintf(stderr,
+			        "wld: this driver leaks a descriptor per GPU fence wait; "
+			        "waiting on fences directly instead\n");
+		}
+		/* Both answers come from this one cycle; do not probe again. */
+		if (probe_identity)
+			fence_behavior_known = true;
+		return waited;
+	}
+
+	/* Unknown only when the probe itself failed: leave the descriptor alone. */
+	if (fence_fd_ownership == FENCE_FD_RETAINED)
+		close(dup_fd);
+
+	return waited;
 }
 
 void
