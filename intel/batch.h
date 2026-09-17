@@ -51,6 +51,13 @@ struct intel_batch {
 	uint32_t command_count;
 };
 
+/*
+ * True when device_id appears in the chipset table, i.e. the batch layer knows
+ * this device's generation and can emit commands for it. This is the same
+ * table intel_batch_initialize() consults, so the two cannot disagree.
+ */
+bool intel_batch_device_supported(int device_id);
+
 bool intel_batch_initialize(struct intel_batch *batch,
                             drm_intel_bufmgr *bufmgr);
 

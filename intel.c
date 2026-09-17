@@ -76,7 +76,18 @@ pack_gray_row_to_mono(uint8_t *dst, const uint8_t *src, uint32_t width)
 bool
 driver_device_supported(uint32_t vendor_id, uint32_t device_id)
 {
-	return vendor_id == 0x8086;
+	if (vendor_id != 0x8086)
+		return false;
+
+	/*
+	 * Declining an Intel device whose generation the batch layer does not know
+	 * is better than claiming it. driver_create_context() would succeed on any
+	 * i915 device, because the GEM buffer manager initializes without
+	 * consulting the chipset at all, and the failure would surface later in
+	 * context_create_renderer() - by which point drm.c has committed to this
+	 * driver and the generic backends behind it are no longer candidates.
+	 */
+	return intel_batch_device_supported((int)device_id);
 }
 
 struct wld_context *

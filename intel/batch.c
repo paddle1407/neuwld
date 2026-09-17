@@ -84,6 +84,12 @@ device_info(int device_id)
 }
 
 bool
+intel_batch_device_supported(int device_id)
+{
+	return device_info(device_id) != NULL;
+}
+
+bool
 intel_batch_initialize(struct intel_batch *batch,
                        drm_intel_bufmgr *bufmgr)
 {

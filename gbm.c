@@ -288,13 +288,12 @@ driver_device_supported(uint32_t vendor_id, uint32_t device_id)
 {
 	/*
 	 * GBM is driver agnostic, so we cannot decide from the PCI ID alone.
-	 * Claim everything and let driver_create_context() fail if the stack
-	 * is not actually usable; drm.c then falls through to the dumb driver.
+	 * Claim everything and let driver_create_context() fail if the stack is
+	 * not actually usable; drm.c then falls through to the next driver.
+	 *
+	 * WLD_DRM_NO_GBM still disables this backend - drm.c applies that to
+	 * every driver uniformly, so it is not handled here.
 	 */
-	if (getenv("WLD_DRM_NO_GBM")) {
-		fprintf(stderr, "wld: GBM backend disabled by WLD_DRM_NO_GBM\n");
-		return false;
-	}
 	return true;
 }
 
