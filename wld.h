@@ -269,6 +269,42 @@ void wld_blend_region(struct wld_renderer *renderer,
                       pixman_region32_t *region);
 
 /**
+ * A destination rectangle, in pixels of the renderer's current target.
+ */
+struct wld_rect {
+	int32_t x, y;
+	uint32_t width, height;
+};
+
+/**
+ * A source rectangle, in pixels of the buffer being read.
+ *
+ * Fractional so that a destination clipped against an edge keeps the exact
+ * sampling origin the unclipped destination would have had. Rounding it to
+ * whole pixels slides the image by up to half a source pixel, which is
+ * visible as a shimmer when the clip moves.
+ */
+struct wld_frect {
+	double x, y, width, height;
+};
+
+/**
+ * Blend `src` of `buffer` into `dst` of the target, scaling to fit.
+ *
+ * The source is treated as premultiplied and composited over the target.
+ * Sampling is bilinear wherever the backend can do it, so a destination the
+ * same size as its source is not guaranteed to be pixel-identical to
+ * wld_blend_region(); use that one when there is no scaling to do.
+ *
+ * Minification much below half size aliases: this is one bilinear tap per
+ * destination pixel, not a box filter over everything it covers.
+ */
+void wld_blend_scaled(struct wld_renderer *renderer,
+                      struct wld_buffer *buffer,
+                      const struct wld_rect *dst,
+                      const struct wld_frect *src);
+
+/**
  * Order subsequent rendering after a DRM sync_file fence.
  *
  * A client using explicit synchronization hands the compositor a fence instead

@@ -48,6 +48,12 @@ static void renderer_blend_region(struct wld_renderer *base,
                                   int32_t dst_x, int32_t dst_y,
                                   pixman_region32_t *region);
 #endif
+#ifdef RENDERER_IMPLEMENTS_BLEND_SCALED
+static void renderer_blend_scaled(struct wld_renderer *base,
+                                  struct buffer *buffer,
+                                  const struct wld_rect *dst,
+                                  const struct wld_frect *src);
+#endif
 static void renderer_draw_text(struct wld_renderer *renderer,
                                struct font *font, uint32_t color,
                                int32_t x, int32_t y,
@@ -80,6 +86,11 @@ static const struct wld_renderer_impl wld_renderer_impl = {
 	.blend_region = &renderer_blend_region,
 #else
 	.blend_region = NULL,
+#endif
+#ifdef RENDERER_IMPLEMENTS_BLEND_SCALED
+	.blend_scaled = &renderer_blend_scaled,
+#else
+	.blend_scaled = NULL,
 #endif
 	.draw_circle = &wld_draw_circle,
 	.draw_line = &wld_draw_line,

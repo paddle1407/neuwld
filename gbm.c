@@ -158,6 +158,7 @@ struct gles_renderer {
 #define BUFFER_IMPLEMENTS_FLUSH
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
+#define RENDERER_IMPLEMENTS_BLEND_SCALED
 #define RENDERER_IMPLEMENTS_READ_PIXELS
 #define RENDERER_IMPLEMENTS_WAIT_FENCE
 #include "interface/buffer.h"
@@ -1116,27 +1117,24 @@ draw_textured_quad(struct gles_renderer *renderer, int32_t x1, int32_t y1,
  * Shared by copy_region and blend_region, which differ only in whether the
  * source is blended over the target or overwrites it.
  */
-static void
-composite_region(struct wld_renderer *base, struct buffer *src_base,
-                 int32_t dst_x, int32_t dst_y, pixman_region32_t *region,
-                 bool blend)
+/*
+ * Bind the textured program to `src_base` and set blending up the way both the
+ * region and the scaled path want it. False when the source has no texture to
+ * draw from, in which case no GL state was touched.
+ */
+static bool
+setup_textured(struct gles_renderer *renderer, struct buffer *src_base,
+               bool blend)
 {
-	struct gles_renderer *renderer = gles_renderer(base);
 	struct gbm_buffer *src = gbm_buffer(&src_base->base);
-	GLfloat src_w, src_h;
 	GLfloat mul[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 	GLfloat add[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	pixman_box32_t *boxes;
 	GLuint texture;
-	int count;
 
 	if (!renderer->target_texture)
-		return;
+		return false;
 	if (!(texture = buffer_texture(src)))
-		return;
-
-	src_w = (GLfloat)src_base->base.width;
-	src_h = (GLfloat)src_base->base.height;
+		return false;
 
 	/* An XRGB source carries no meaningful alpha, so force it opaque. */
 	if (src_base->base.format == WLD_FORMAT_XRGB8888) {
@@ -1159,6 +1157,23 @@ composite_region(struct wld_renderer *base, struct buffer *src_base,
 	} else {
 		glDisable(GL_BLEND);
 	}
+
+	return true;
+}
+
+static void
+composite_region(struct wld_renderer *base, struct buffer *src_base,
+                 int32_t dst_x, int32_t dst_y, pixman_region32_t *region,
+                 bool blend)
+{
+	struct gles_renderer *renderer = gles_renderer(base);
+	GLfloat src_w = (GLfloat)src_base->base.width;
+	GLfloat src_h = (GLfloat)src_base->base.height;
+	pixman_box32_t *boxes;
+	int count;
+
+	if (!setup_textured(renderer, src_base, blend))
+		return;
 
 	boxes = pixman_region32_rectangles(region, &count);
 	while (count--) {
@@ -1292,6 +1307,40 @@ renderer_blend_region(struct wld_renderer *base, struct buffer *src,
                       int32_t dst_x, int32_t dst_y, pixman_region32_t *region)
 {
 	composite_region(base, src, dst_x, dst_y, region, true);
+}
+
+void
+renderer_blend_scaled(struct wld_renderer *base, struct buffer *src_base,
+                      const struct wld_rect *dst, const struct wld_frect *src)
+{
+	struct gles_renderer *renderer = gles_renderer(base);
+	GLfloat src_w = (GLfloat)src_base->base.width;
+	GLfloat src_h = (GLfloat)src_base->base.height;
+
+	if (src_w <= 0.0f || src_h <= 0.0f)
+		return;
+	if (!setup_textured(renderer, src_base, true))
+		return;
+
+	/*
+	 * One quad, with the source rectangle's edges as texture coordinates and
+	 * the destination's as vertex positions. The sampler does the scaling,
+	 * and because texture coordinates are interpolated to fragment centres it
+	 * does the half-texel bookkeeping that the pixman path has to spell out
+	 * in scaled_transform() for itself.
+	 *
+	 * buffer_texture() already asks for GL_LINEAR in both directions, so
+	 * there is no filter state to set here.
+	 */
+	draw_textured_quad(renderer, dst->x, dst->y,
+	                   dst->x + (int32_t)dst->width,
+	                   dst->y + (int32_t)dst->height,
+	                   (GLfloat)(src->x / src_w), (GLfloat)(src->y / src_h),
+	                   (GLfloat)((src->x + src->width) / src_w),
+	                   (GLfloat)((src->y + src->height) / src_h),
+	                   renderer->textured.pos, renderer->textured.texcoord);
+
+	glDisable(GL_BLEND);
 }
 
 /*

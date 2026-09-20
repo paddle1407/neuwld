@@ -212,6 +212,64 @@ unmap_src:
 	wld_unmap(buffer);
 }
 
+EXPORT
+void
+wld_blend_scaled(struct wld_renderer *renderer, struct wld_buffer *buffer,
+                 const struct wld_rect *dst, const struct wld_frect *src)
+{
+	pixman_image_t *source = NULL, *target = NULL;
+	pixman_transform_t transform;
+
+	if (!renderer->target || dst->width == 0 || dst->height == 0)
+		return;
+	if (src->width <= 0.0 || src->height <= 0.0)
+		return;
+
+	/* An accelerated backend scales on the GPU and skips the readback below. */
+	if (renderer->impl->blend_scaled) {
+		renderer->impl->blend_scaled(renderer, (struct buffer *)buffer, dst,
+		                             src);
+		return;
+	}
+
+	/* Complete accelerator writes before accessing the buffers on the CPU. */
+	renderer->impl->flush(renderer);
+	if (!wld_map(buffer))
+		return;
+	if (!wld_map(renderer->target))
+		goto unmap_source;
+
+	source = pixman_image_create_bits(format_wld_to_pixman(buffer->format),
+	                                  buffer->width, buffer->height,
+	                                  buffer->map, buffer->pitch);
+	target = pixman_image_create_bits(
+	    format_wld_to_pixman(renderer->target->format),
+	    renderer->target->width, renderer->target->height,
+	    renderer->target->map, renderer->target->pitch);
+	if (!source || !target)
+		goto destroy_images;
+
+	scaled_transform(&transform, dst, src);
+	pixman_image_set_transform(source, &transform);
+	pixman_image_set_filter(source, PIXMAN_FILTER_BILINEAR, NULL, 0);
+	/*
+	 * The transform carries the source origin, so the composite reads from
+	 * (0, 0) and every destination pixel is asked for by its own coordinate.
+	 */
+	pixman_image_composite32(PIXMAN_OP_OVER, source, NULL, target,
+	                         0, 0, 0, 0, dst->x, dst->y,
+	                         dst->width, dst->height);
+
+destroy_images:
+	if (source)
+		pixman_image_unref(source);
+	if (target)
+		pixman_image_unref(target);
+	wld_unmap(renderer->target);
+unmap_source:
+	wld_unmap(buffer);
+}
+
 
 /* https://en.wikipedia.org/wiki/Midpoint_circle_algorithm */
 static void

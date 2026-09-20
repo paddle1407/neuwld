@@ -123,6 +123,15 @@ struct wld_renderer_impl {
 	void (*blend_region)(struct wld_renderer *renderer, struct buffer *src,
 	                     int32_t dst_x, int32_t dst_y,
 	                     pixman_region32_t *region);
+	/**
+	 * Optional. Blends a source rectangle into a destination rectangle of a
+	 * different size. When NULL, wld_blend_scaled() falls back to mapping
+	 * both buffers and scaling on the CPU, which on an accelerated backend
+	 * costs a full readback and pipeline stall per call.
+	 */
+	void (*blend_scaled)(struct wld_renderer *renderer, struct buffer *src,
+	                     const struct wld_rect *dst,
+	                     const struct wld_frect *src_rect);
 	void (*draw_circle)(struct wld_renderer *renderer, uint32_t color,
 				int32_t x, int32_t y, uint32_t r, bool fill);
 	void (*draw_line)(struct wld_renderer *renderer, uint32_t color,
@@ -201,6 +210,34 @@ format_bytes_per_pixel(enum wld_format format)
 		return 0;
 	}
 }
+/*
+ * The pixman transform that maps the destination rectangle `dst` back onto
+ * the source rectangle `src`, which is the direction pixman samples in.
+ *
+ * The half-pixel terms are the difference between an edge coordinate and a
+ * centre one. pixman hands the filter the coordinate of the destination
+ * pixel's centre and expects back the centre of the source pixel to sample,
+ * while `src` names the rectangle's edges; without the correction the image
+ * lands half a source pixel off, which at large minification is most of a
+ * destination pixel.
+ *
+ * At scale 1 with an integral origin it reduces to a plain translation, so a
+ * scaled blit that is not scaling anything still copies exactly.
+ */
+static inline void
+scaled_transform(pixman_transform_t *transform,
+                 const struct wld_rect *dst, const struct wld_frect *src)
+{
+	double scale_x = src->width / (double)dst->width;
+	double scale_y = src->height / (double)dst->height;
+
+	pixman_transform_init_identity(transform);
+	transform->matrix[0][0] = pixman_double_to_fixed(scale_x);
+	transform->matrix[1][1] = pixman_double_to_fixed(scale_y);
+	transform->matrix[0][2] = pixman_double_to_fixed(src->x + scale_x / 2 - 0.5);
+	transform->matrix[1][2] = pixman_double_to_fixed(src->y + scale_y / 2 - 0.5);
+}
+
 
 static inline pixman_format_code_t
 format_wld_to_pixman(uint32_t format)

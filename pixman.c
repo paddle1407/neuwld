@@ -53,6 +53,7 @@ struct pixman_map {
 
 #include "interface/context.h"
 #define RENDERER_IMPLEMENTS_REGION
+#define RENDERER_IMPLEMENTS_BLEND_SCALED
 #include "interface/buffer.h"
 #include "interface/renderer.h"
 IMPL(pixman_renderer, wld_renderer)
@@ -336,6 +337,38 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
 	pixman_image_set_clip_region32(dst, NULL);
 
 	pixman_region32_fini(&clip);
+}
+
+void
+renderer_blend_scaled(struct wld_renderer *base, struct buffer *buffer,
+                      const struct wld_rect *dst, const struct wld_frect *src)
+{
+	struct pixman_renderer *renderer = pixman_renderer(base);
+	pixman_image_t *source = pixman_image(buffer), *target = renderer->target;
+	pixman_transform_t transform;
+
+	if (!source)
+		return;
+
+	scaled_transform(&transform, dst, src);
+	pixman_image_set_transform(source, &transform);
+	pixman_image_set_filter(source, PIXMAN_FILTER_BILINEAR, NULL, 0);
+	/*
+	 * The transform carries the source origin, so the composite reads from
+	 * (0, 0) and every destination pixel is asked for by its own coordinate.
+	 */
+	pixman_image_composite32(PIXMAN_OP_OVER, source, NULL, target,
+	                         0, 0, 0, 0, dst->x, dst->y,
+	                         dst->width, dst->height);
+
+	/*
+	 * pixman_image() hands back a cached image for anything not native to
+	 * this backend, so the transform and filter have to come off again or
+	 * the next unscaled copy from the same buffer inherits them.
+	 */
+	pixman_image_set_transform(source, NULL);
+	pixman_image_set_filter(source, PIXMAN_FILTER_NEAREST, NULL, 0);
+	pixman_image_unref(source);
 }
 
 static inline uint8_t
