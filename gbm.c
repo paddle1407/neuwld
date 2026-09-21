@@ -55,23 +55,44 @@
 
 #include <fontconfig/fontconfig.h>
 
-/*
- * How long a direct wait on a fence descriptor may block. A client that
- * never signals must not wedge the caller; one frame at 60Hz is 16ms.
- */
-#define FENCE_WAIT_MS 50
+/* Past this many boxes, a dirty region is uploaded as its bounding box. */
+#define DIRTY_BOX_LIMIT 16
 
-/* Number of glyph textures cached per renderer. */
-#define GLYPH_CACHE_SIZE 512
+/*
+ * Glyphs live in one alpha atlas per context, shared by every renderer on it.
+ * The table is open-addressed on the glyph's serial; once it is three quarters
+ * full or the atlas has no room left, both are emptied and refilled on demand,
+ * which bounds the cache at one texture and one table whatever is drawn.
+ */
+#define GLYPH_ATLAS_SIZE 1024
+#define GLYPH_TABLE_SIZE 4096
+#define GLYPH_TABLE_LOAD (GLYPH_TABLE_SIZE / 4 * 3)
+/* Blank texels between glyphs, so filtering never reaches a neighbour. */
+#define GLYPH_PADDING 1
+
+/* Fixed attribute locations, bound before linking, shared by all programs. */
+#define ATTRIB_POS 0
+#define ATTRIB_TEXCOORD 1
+/* Every vertex is x, y, s, t; a quad is two triangles. */
+#define VERTEX_FLOATS 4
+#define QUAD_FLOATS (6 * VERTEX_FLOATS)
 
 /* Keep window-sized CPU pixel storage out of malloc's retained heap arenas.
  * Small images still use calloc to avoid a mapping/page per tiny asset. */
 #define PIXEL_MAPPING_THRESHOLD (256u * 1024u)
 
-struct glyph_entry {
-	uint64_t serial;
+struct glyph_slot {
+	uint64_t serial; /* 0 marks an empty slot; serials start at 1 */
+	uint16_t x, y, width, height;
+};
+
+struct glyph_atlas {
 	GLuint texture;
-	uint32_t width, height;
+	uint32_t size;
+	/* Shelf packing: glyphs fill a row left to right, rows stack down. */
+	uint32_t shelf_x, shelf_y, shelf_height;
+	unsigned count;
+	struct glyph_slot *slots;
 };
 
 struct gbm_context {
@@ -88,11 +109,36 @@ struct gbm_context {
 	PFNEGLCREATESYNCKHRPROC create_sync;
 	PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 	PFNEGLWAITSYNCKHRPROC wait_sync;
+	PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_native_fence_fd;
 
 	bool has_modifiers;
 	bool has_unpack_subimage;
 	/* Set when a client's DRM sync_file fence can be waited on by the GPU. */
 	bool has_fence_sync;
+	/* Set when our own rendering can be exported as a sync_file. */
+	bool has_native_fence;
+	/*
+	 * Set while rendering has been submitted without being waited for, which
+	 * a CPU mapping of one of our buffers has to catch up on first.
+	 */
+	bool unfinished;
+
+	/*
+	 * GL state belongs to the context, and every renderer created from it
+	 * shares that one context, so what is currently bound is tracked here.
+	 * Changes go through the helpers below, which skip redundant calls.
+	 */
+	struct {
+		GLuint program, texture, fbo;
+		int blend; /* -1 until first set */
+	} gl;
+
+	/* Quads are staged here and drawn in one call per batch. */
+	GLuint vbo;
+	GLfloat *verts;
+	size_t verts_capacity; /* in quads */
+
+	struct glyph_atlas atlas;
 };
 
 struct gbm_buffer {
@@ -125,8 +171,19 @@ struct gbm_buffer {
 	bool cpu;
 	bool dumb;
 	bool tex_allocated;
+	/* Allocated for KMS, which is fenced by wld_export_fence(), not flush. */
+	bool scanout;
 	size_t mapping_size;
+
+	/*
+	 * What of a CPU buffer's texture is stale. `dirty` covers all of it;
+	 * otherwise only `dirty_region` has to be uploaded again. A CPU renderer
+	 * reports what it drew through buffer_damage() before it flushes, and
+	 * `damage_reported` tells that flush it need not assume the worst.
+	 */
 	bool dirty;
+	bool damage_reported;
+	pixman_region32_t dirty_region;
 };
 
 struct gles_renderer {
@@ -137,30 +194,41 @@ struct gles_renderer {
 	GLuint target_texture;
 	uint32_t target_width, target_height;
 
+	/*
+	 * Uniforms are program state, and the programs are this renderer's own,
+	 * so the values last loaded into them are tracked here.
+	 */
 	struct {
 		GLuint program;
-		GLint pos, proj, color;
+		GLint proj, color;
+		bool proj_valid, color_valid;
+		GLfloat color_value[4];
 	} solid;
 	struct {
 		GLuint program;
-		GLint pos, texcoord, proj, tex, mul, add;
+		GLint proj, mul, add;
+		bool proj_valid;
+		int opaque; /* -1 until mul/add are first loaded */
 	} textured;
 	struct {
 		GLuint program;
-		GLint pos, texcoord, proj, tex, color;
+		GLint proj, color;
+		bool proj_valid, color_valid;
+		GLfloat color_value[4];
 	} glyph;
 
 	GLfloat proj[16];
-	struct glyph_entry glyphs[GLYPH_CACHE_SIZE];
 };
 
 #define CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
 #define BUFFER_IMPLEMENTS_FLUSH
+#define BUFFER_IMPLEMENTS_DAMAGE
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
 #define RENDERER_IMPLEMENTS_BLEND_SCALED
 #define RENDERER_IMPLEMENTS_READ_PIXELS
 #define RENDERER_IMPLEMENTS_WAIT_FENCE
+#define RENDERER_IMPLEMENTS_EXPORT_FENCE
 #include "interface/buffer.h"
 #include "interface/context.h"
 #include "interface/renderer.h"
@@ -249,6 +317,10 @@ link_program(const char *vertex_source, const char *fragment_source)
 	program = glCreateProgram();
 	glAttachShader(program, vertex);
 	glAttachShader(program, fragment);
+	/* The vertex layout is shared, so every program reads it from the same
+	 * slots; a name a shader does not use is simply ignored. */
+	glBindAttribLocation(program, ATTRIB_POS, "pos");
+	glBindAttribLocation(program, ATTRIB_TEXCOORD, "texcoord");
 	glLinkProgram(program);
 	glDeleteShader(vertex);
 	glDeleteShader(fragment);
@@ -362,7 +434,7 @@ driver_create_context(int drm_fd)
 	EGLConfig config = EGL_NO_CONFIG_KHR;
 	EGLint num_configs;
 
-	if (!(context = malloc(sizeof *context)))
+	if (!(context = calloc(1, sizeof *context)))
 		return NULL;
 
 	context->fd = drm_fd;
@@ -459,6 +531,10 @@ driver_create_context(int drm_fd)
 		    (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
 		context->has_fence_sync = context->create_sync
 		    && context->destroy_sync && context->wait_sync;
+		context->dup_native_fence_fd = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)
+		    eglGetProcAddress("eglDupNativeFenceFDANDROID");
+		context->has_native_fence =
+		    context->has_fence_sync && context->dup_native_fence_fd;
 	}
 	if (!context->has_fence_sync) {
 		fprintf(stderr, "wld: GBM has no EGL fence sync; explicit client "
@@ -477,6 +553,25 @@ driver_create_context(int drm_fd)
 		    has_extension(gl_ext, "GL_EXT_unpack_subimage");
 	}
 
+	/*
+	 * State nothing ever changes is set once: one vertex buffer with a fixed
+	 * layout, one texture unit, and premultiplied-alpha blending whenever
+	 * blending is on at all.
+	 */
+	glGenBuffers(1, &context->vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, context->vbo);
+	glVertexAttribPointer(ATTRIB_POS, 2, GL_FLOAT, GL_FALSE,
+	                      VERTEX_FLOATS * sizeof(GLfloat), (void *)0);
+	glVertexAttribPointer(ATTRIB_TEXCOORD, 2, GL_FLOAT, GL_FALSE,
+	                      VERTEX_FLOATS * sizeof(GLfloat),
+	                      (void *)(2 * sizeof(GLfloat)));
+	glEnableVertexAttribArray(ATTRIB_POS);
+	glEnableVertexAttribArray(ATTRIB_TEXCOORD);
+	glActiveTexture(GL_TEXTURE0);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	glDisable(GL_BLEND);
+	context->gl.blend = 0;
+
 	context_initialize(&context->base, &wld_context_impl);
 	DEBUG("using GBM/EGL context (EGL %d.%d)\n", major, minor);
 	fprintf(stderr, "wld: EGL %d.%d, GL renderer: %s, vendor: %s\n",
@@ -494,6 +589,47 @@ error1:
 error0:
 	free(context);
 	return NULL;
+}
+
+/**** GL state ****/
+
+static void
+use_program(struct gbm_context *context, GLuint program)
+{
+	if (context->gl.program != program) {
+		glUseProgram(program);
+		context->gl.program = program;
+	}
+}
+
+static void
+bind_texture(struct gbm_context *context, GLuint texture)
+{
+	if (context->gl.texture != texture) {
+		glBindTexture(GL_TEXTURE_2D, texture);
+		context->gl.texture = texture;
+	}
+}
+
+/* Deleting a bound texture unbinds it, and its name can be handed out again. */
+static void
+delete_texture(struct gbm_context *context, GLuint texture)
+{
+	glDeleteTextures(1, &texture);
+	if (context->gl.texture == texture)
+		context->gl.texture = 0;
+}
+
+static void
+set_blend(struct gbm_context *context, bool blend)
+{
+	if (context->gl.blend != blend) {
+		if (blend)
+			glEnable(GL_BLEND);
+		else
+			glDisable(GL_BLEND);
+		context->gl.blend = blend;
+	}
 }
 
 /**** Buffer ****/
@@ -595,6 +731,7 @@ new_buffer(struct gbm_context *context, struct gbm_bo *bo, EGLImageKHR image,
 	buffer->handle = handle;
 	buffer->own_handle = own_handle;
 	buffer->map_data = NULL;
+	pixman_region32_init(&buffer->dirty_region);
 	buffer->exporter.export = &export;
 	wld_buffer_add_exporter(&buffer->base.base, &buffer->exporter);
 
@@ -742,6 +879,7 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	if (!buffer)
 		goto error1;
 
+	gbm_buffer(&buffer->base)->scanout = flags & WLD_DRM_FLAG_SCANOUT;
 	return buffer;
 
 error1:
@@ -857,6 +995,12 @@ context_destroy(struct wld_context *base)
 {
 	struct gbm_context *context = gbm_context(base);
 
+	if (context->atlas.texture)
+		glDeleteTextures(1, &context->atlas.texture);
+	free(context->atlas.slots);
+	glDeleteBuffers(1, &context->vbo);
+	free(context->verts);
+
 	eglMakeCurrent(context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
 	               EGL_NO_CONTEXT);
 	eglDestroyContext(context->display, context->context);
@@ -881,6 +1025,12 @@ buffer_map(struct buffer *base)
 	/* Imported client dmabufs are not CPU accessible through GBM. */
 	if (!buffer->bo)
 		return false;
+
+	/* The GPU may still be writing it; see renderer_flush(). */
+	if (buffer->context->unfinished) {
+		glFinish();
+		buffer->context->unfinished = false;
+	}
 
 	data = gbm_bo_map(buffer->bo, 0, 0, base->base.width, base->base.height,
 	                  GBM_BO_TRANSFER_READ_WRITE, &stride, &buffer->map_data);
@@ -924,16 +1074,41 @@ buffer_unmap(struct buffer *base)
 }
 
 void
+buffer_damage(struct buffer *base, pixman_region32_t *region)
+{
+	struct gbm_buffer *buffer = gbm_buffer(&base->base);
+
+	if (!buffer->cpu)
+		return;
+
+	buffer->damage_reported = true;
+	if (!region) {
+		buffer->dirty = true;
+		return;
+	}
+
+	pixman_region32_union(&buffer->dirty_region, &buffer->dirty_region,
+	                      region);
+	pixman_region32_intersect_rect(&buffer->dirty_region,
+	                               &buffer->dirty_region, 0, 0,
+	                               base->base.width, base->base.height);
+}
+
+void
 buffer_flush(struct buffer *base)
 {
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
 	/*
 	 * Called once the renderer targeting this buffer is done with it, which
-	 * for a dumb buffer means the CPU has just finished drawing into it.
+	 * for a CPU buffer means the CPU has just finished drawing into it. Unless
+	 * that renderer said where, it could have been anywhere.
 	 */
-	if (buffer->cpu)
-		buffer->dirty = true;
+	if (buffer->cpu) {
+		if (!buffer->damage_reported)
+			buffer->dirty = true;
+		buffer->damage_reported = false;
+	}
 }
 
 void
@@ -942,7 +1117,8 @@ buffer_destroy(struct buffer *base)
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
 	if (buffer->texture)
-		glDeleteTextures(1, &buffer->texture);
+		delete_texture(buffer->context, buffer->texture);
+	pixman_region32_fini(&buffer->dirty_region);
 
 	if (buffer->cpu) {
 		if (buffer->dumb) {
@@ -979,6 +1155,50 @@ buffer_destroy(struct buffer *base)
 
 /**** Renderer ****/
 
+/*
+ * Copy one box of a CPU buffer's pixels into its texture, which is bound.
+ *
+ * GLES2 has no GL_UNPACK_ROW_LENGTH, so without GL_EXT_unpack_subimage the
+ * rows of a box narrower than the pitch cannot be uploaded in one call.
+ */
+static void
+upload_box(struct gbm_buffer *buffer, const pixman_box32_t *box)
+{
+	uint32_t pitch = buffer->base.base.pitch;
+	uint32_t row_pixels = pitch / 4;
+	int32_t x = box->x1, y = box->y1;
+	int32_t width = box->x2 - box->x1, height = box->y2 - box->y1;
+	const uint8_t *pixels = buffer->base.base.map;
+
+	if (width <= 0 || height <= 0)
+		return;
+
+	if (row_pixels == (uint32_t)width) {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
+		                GL_UNSIGNED_BYTE, pixels + (size_t)y * pitch);
+	} else if (buffer->context->has_unpack_subimage) {
+		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
+		                GL_UNSIGNED_BYTE,
+		                pixels + (size_t)y * pitch + (size_t)x * 4);
+		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+	} else if (row_pixels == buffer->base.base.width) {
+		/* Whole rows are contiguous, so widen the box to them. */
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, row_pixels, height,
+		                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+		                pixels + (size_t)y * pitch);
+	} else {
+		int32_t row;
+
+		for (row = 0; row < height; ++row) {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, x, y + row, width, 1,
+			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+			                pixels + (size_t)(y + row) * pitch
+			                    + (size_t)x * 4);
+		}
+	}
+}
+
 /* Lazily wrap a buffer's EGLImage in a GL texture. */
 static GLuint
 buffer_texture(struct gbm_buffer *buffer)
@@ -990,7 +1210,7 @@ buffer_texture(struct gbm_buffer *buffer)
 			return 0;
 
 		glGenTextures(1, &buffer->texture);
-		glBindTexture(GL_TEXTURE_2D, buffer->texture);
+		bind_texture(buffer->context, buffer->texture);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1004,16 +1224,17 @@ buffer_texture(struct gbm_buffer *buffer)
 	}
 
 	/* CPU-backed contents live in system memory and must be uploaded. */
-	if (buffer->cpu && (fresh || buffer->dirty)) {
+	if (buffer->cpu && (fresh || buffer->dirty
+	                    || pixman_region32_not_empty(&buffer->dirty_region))) {
 		uint32_t width = buffer->base.base.width;
 		uint32_t height = buffer->base.base.height;
-		uint32_t pitch = buffer->base.base.pitch;
-		uint32_t row_pixels = pitch / 4;
+		pixman_box32_t full = { 0, 0, width, height }, *boxes;
+		int count;
 
 		if (!buffer->base.base.map)
 			return 0;
 
-		glBindTexture(GL_TEXTURE_2D, buffer->texture);
+		bind_texture(buffer->context, buffer->texture);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
 		/* Allocate storage once; refreshes are sub-image updates. */
@@ -1023,29 +1244,27 @@ buffer_texture(struct gbm_buffer *buffer)
 			buffer->tex_allocated = true;
 		}
 
-		if (row_pixels == width) {
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
-			                buffer->base.base.map);
-		} else if (buffer->context->has_unpack_subimage) {
-			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
-			                buffer->base.base.map);
-			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+		if (fresh || buffer->dirty) {
+			boxes = &full;
+			count = 1;
 		} else {
-			/* GLES2 without GL_EXT_unpack_subimage cannot skip padding. */
-			uint32_t y;
-
-			for (y = 0; y < height; ++y) {
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_BGRA_EXT,
-				                GL_UNSIGNED_BYTE,
-				                (uint8_t *)buffer->base.base.map
-				                    + (size_t)y * pitch);
+			boxes = pixman_region32_rectangles(&buffer->dirty_region, &count);
+			/*
+			 * A region fragmented into many small boxes costs more in calls
+			 * than the few extra bytes its bounding box would upload.
+			 */
+			if (count > DIRTY_BOX_LIMIT) {
+				boxes = pixman_region32_extents(&buffer->dirty_region);
+				count = 1;
 			}
 		}
 
+		while (count--) {
+			upload_box(buffer, boxes++);
+		}
+
 		buffer->dirty = false;
+		pixman_region32_clear(&buffer->dirty_region);
 	}
 
 	return buffer->texture;
@@ -1068,97 +1287,167 @@ set_projection(struct gles_renderer *renderer, uint32_t width, uint32_t height)
 	renderer->proj[12] = -1.0f;
 	renderer->proj[13] = -1.0f;
 	renderer->proj[15] = 1.0f;
-}
 
-static void
-draw_quad(GLint pos_attrib, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
-{
-	GLfloat verts[8] = {
-		x1, y1,
-		x2, y1,
-		x1, y2,
-		x2, y2,
-	};
-
-	glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, verts);
-	glEnableVertexAttribArray(pos_attrib);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	glDisableVertexAttribArray(pos_attrib);
-}
-
-static void
-draw_textured_quad(struct gles_renderer *renderer, int32_t x1, int32_t y1,
-                   int32_t x2, int32_t y2, GLfloat s1, GLfloat t1, GLfloat s2,
-                   GLfloat t2, GLint pos_attrib, GLint tex_attrib)
-{
-	GLfloat verts[8] = {
-		x1, y1,
-		x2, y1,
-		x1, y2,
-		x2, y2,
-	};
-	GLfloat texcoords[8] = {
-		s1, t1,
-		s2, t1,
-		s1, t2,
-		s2, t2,
-	};
-
-	glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, verts);
-	glEnableVertexAttribArray(pos_attrib);
-	glVertexAttribPointer(tex_attrib, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
-	glEnableVertexAttribArray(tex_attrib);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	glDisableVertexAttribArray(pos_attrib);
-	glDisableVertexAttribArray(tex_attrib);
+	renderer->solid.proj_valid = false;
+	renderer->textured.proj_valid = false;
+	renderer->glyph.proj_valid = false;
 }
 
 /*
- * Shared by copy_region and blend_region, which differ only in whether the
- * source is blended over the target or overwrites it.
+ * Make this renderer's framebuffer the one drawn to. Renderers share the GL
+ * context, so another one may have bound its own since our target was set.
  */
+static bool
+bind_target(struct gles_renderer *renderer)
+{
+	struct gbm_context *context = renderer->context;
+
+	if (!renderer->target_texture)
+		return false;
+
+	if (context->gl.fbo != renderer->fbo) {
+		glBindFramebuffer(GL_FRAMEBUFFER, renderer->fbo);
+		glViewport(0, 0, renderer->target_width, renderer->target_height);
+		context->gl.fbo = renderer->fbo;
+	}
+
+	return true;
+}
+
+static void
+load_projection(struct gles_renderer *renderer, GLint location, bool *valid)
+{
+	if (!*valid) {
+		glUniformMatrix4fv(location, 1, GL_FALSE, renderer->proj);
+		*valid = true;
+	}
+}
+
+static void
+load_color(GLint location, const GLfloat rgba[4], GLfloat cached[4],
+           bool *valid)
+{
+	if (!*valid || memcmp(cached, rgba, 4 * sizeof(GLfloat)) != 0) {
+		glUniform4fv(location, 1, rgba);
+		memcpy(cached, rgba, 4 * sizeof(GLfloat));
+		*valid = true;
+	}
+}
+
+/**** Batching ****/
+
+/*
+ * Room for `quads` quads in the staging array. Returns NULL, having drawn
+ * nothing, if that much memory cannot be had.
+ */
+static GLfloat *
+reserve_quads(struct gbm_context *context, size_t quads)
+{
+	GLfloat *verts;
+	size_t capacity;
+
+	if (quads <= context->verts_capacity)
+		return context->verts;
+
+	capacity = context->verts_capacity ? context->verts_capacity : 64;
+	while (capacity < quads) {
+		if (capacity > SIZE_MAX / 2 / (QUAD_FLOATS * sizeof(GLfloat)))
+			return NULL;
+		capacity *= 2;
+	}
+
+	if (!(verts = realloc(context->verts,
+	                      capacity * QUAD_FLOATS * sizeof(GLfloat))))
+		return NULL;
+
+	context->verts = verts;
+	context->verts_capacity = capacity;
+	return verts;
+}
+
+static GLfloat *
+put_quad(GLfloat *v, GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2,
+         GLfloat s1, GLfloat t1, GLfloat s2, GLfloat t2)
+{
+	const GLfloat quad[QUAD_FLOATS] = {
+		x1, y1, s1, t1,
+		x2, y1, s2, t1,
+		x1, y2, s1, t2,
+		x2, y1, s2, t1,
+		x2, y2, s2, t2,
+		x1, y2, s1, t2,
+	};
+
+	memcpy(v, quad, sizeof quad);
+	return v + QUAD_FLOATS;
+}
+
+/* Draw the first `quads` staged quads with whatever state is bound. */
+static void
+draw_quads(struct gbm_context *context, size_t quads)
+{
+	if (!quads)
+		return;
+
+	glBufferData(GL_ARRAY_BUFFER, quads * QUAD_FLOATS * sizeof(GLfloat),
+	             context->verts, GL_STREAM_DRAW);
+	glDrawArrays(GL_TRIANGLES, 0, quads * 6);
+}
+
 /*
  * Bind the textured program to `src_base` and set blending up the way both the
- * region and the scaled path want it. False when the source has no texture to
- * draw from, in which case no GL state was touched.
+ * region and the scaled path want it. False when there is no target or the
+ * source has no texture to draw from.
  */
 static bool
 setup_textured(struct gles_renderer *renderer, struct buffer *src_base,
                bool blend)
 {
+	struct gbm_context *context = renderer->context;
 	struct gbm_buffer *src = gbm_buffer(&src_base->base);
-	GLfloat mul[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-	GLfloat add[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	GLuint texture;
+	bool opaque;
 
-	if (!renderer->target_texture)
+	if (!bind_target(renderer))
 		return false;
 	if (!(texture = buffer_texture(src)))
 		return false;
 
+	use_program(context, renderer->textured.program);
+	load_projection(renderer, renderer->textured.proj,
+	                &renderer->textured.proj_valid);
+
 	/* An XRGB source carries no meaningful alpha, so force it opaque. */
-	if (src_base->base.format == WLD_FORMAT_XRGB8888) {
-		mul[3] = 0.0f;
-		add[3] = 1.0f;
+	opaque = src_base->base.format == WLD_FORMAT_XRGB8888;
+	if (renderer->textured.opaque != opaque) {
+		GLfloat mul[4] = { 1.0f, 1.0f, 1.0f, opaque ? 0.0f : 1.0f };
+		GLfloat add[4] = { 0.0f, 0.0f, 0.0f, opaque ? 1.0f : 0.0f };
+
+		glUniform4fv(renderer->textured.mul, 1, mul);
+		glUniform4fv(renderer->textured.add, 1, add);
+		renderer->textured.opaque = opaque;
 	}
 
-	glUseProgram(renderer->textured.program);
-	glUniformMatrix4fv(renderer->textured.proj, 1, GL_FALSE, renderer->proj);
-	glUniform4fv(renderer->textured.mul, 1, mul);
-	glUniform4fv(renderer->textured.add, 1, add);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, texture);
-	glUniform1i(renderer->textured.tex, 0);
-
-	if (blend) {
-		glEnable(GL_BLEND);
-		/* wld buffers hold premultiplied alpha. */
-		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	} else {
-		glDisable(GL_BLEND);
-	}
+	bind_texture(context, texture);
+	/* wld buffers hold premultiplied alpha. */
+	set_blend(context, blend);
 
 	return true;
+}
+
+static void
+setup_solid(struct gles_renderer *renderer, uint32_t color)
+{
+	struct gbm_context *context = renderer->context;
+	GLfloat rgba[4];
+
+	color_to_gl(color, rgba);
+	use_program(context, renderer->solid.program);
+	load_projection(renderer, renderer->solid.proj,
+	                &renderer->solid.proj_valid);
+	load_color(renderer->solid.color, rgba, renderer->solid.color_value,
+	           &renderer->solid.color_valid);
+	set_blend(context, false);
 }
 
 static void
@@ -1170,22 +1459,26 @@ composite_region(struct wld_renderer *base, struct buffer *src_base,
 	GLfloat src_w = (GLfloat)src_base->base.width;
 	GLfloat src_h = (GLfloat)src_base->base.height;
 	pixman_box32_t *boxes;
-	int count;
-
-	if (!setup_textured(renderer, src_base, blend))
-		return;
+	GLfloat *v;
+	int count, i;
 
 	boxes = pixman_region32_rectangles(region, &count);
-	while (count--) {
-		draw_textured_quad(renderer, boxes->x1 + dst_x, boxes->y1 + dst_y,
-		                   boxes->x2 + dst_x, boxes->y2 + dst_y,
-		                   boxes->x1 / src_w, boxes->y1 / src_h,
-		                   boxes->x2 / src_w, boxes->y2 / src_h,
-		                   renderer->textured.pos, renderer->textured.texcoord);
-		++boxes;
+	if (count <= 0)
+		return;
+	if (!setup_textured(renderer, src_base, blend))
+		return;
+	if (!(v = reserve_quads(renderer->context, count)))
+		return;
+
+	/* Every box shares the program, texture and blend, so one draw does. */
+	for (i = 0; i < count; ++i) {
+		v = put_quad(v, boxes[i].x1 + dst_x, boxes[i].y1 + dst_y,
+		             boxes[i].x2 + dst_x, boxes[i].y2 + dst_y,
+		             boxes[i].x1 / src_w, boxes[i].y1 / src_h,
+		             boxes[i].x2 / src_w, boxes[i].y2 / src_h);
 	}
 
-	glDisable(GL_BLEND);
+	draw_quads(renderer->context, count);
 }
 
 uint32_t
@@ -1206,6 +1499,7 @@ bool
 renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
+	struct gbm_context *context = renderer->context;
 	GLuint texture;
 
 	if (!buffer) {
@@ -1220,6 +1514,7 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 		return false;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, renderer->fbo);
+	context->gl.fbo = renderer->fbo;
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 	                       texture, 0);
 
@@ -1230,10 +1525,14 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	}
 
 	renderer->target_texture = texture;
-	renderer->target_width = buffer->base.width;
-	renderer->target_height = buffer->base.height;
 	glViewport(0, 0, buffer->base.width, buffer->base.height);
-	set_projection(renderer, buffer->base.width, buffer->base.height);
+	if (renderer->target_width != buffer->base.width
+	    || renderer->target_height != buffer->base.height
+	    || !renderer->proj[15]) {
+		renderer->target_width = buffer->base.width;
+		renderer->target_height = buffer->base.height;
+		set_projection(renderer, buffer->base.width, buffer->base.height);
+	}
 
 	return true;
 }
@@ -1243,18 +1542,16 @@ renderer_fill_rectangle(struct wld_renderer *base, uint32_t color, int32_t x,
                         int32_t y, uint32_t width, uint32_t height)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
-	GLfloat rgba[4];
+	GLfloat *v;
 
-	if (!renderer->target_texture)
+	if (!bind_target(renderer))
+		return;
+	if (!(v = reserve_quads(renderer->context, 1)))
 		return;
 
-	color_to_gl(color, rgba);
-	glDisable(GL_BLEND);
-	glUseProgram(renderer->solid.program);
-	glUniformMatrix4fv(renderer->solid.proj, 1, GL_FALSE, renderer->proj);
-	glUniform4fv(renderer->solid.color, 1, rgba);
-	draw_quad(renderer->solid.pos, x, y, x + (int32_t)width,
-	          y + (int32_t)height);
+	setup_solid(renderer, color);
+	put_quad(v, x, y, x + (int32_t)width, y + (int32_t)height, 0, 0, 0, 0);
+	draw_quads(renderer->context, 1);
 }
 
 void
@@ -1263,24 +1560,21 @@ renderer_fill_region(struct wld_renderer *base, uint32_t color,
 {
 	struct gles_renderer *renderer = gles_renderer(base);
 	pixman_box32_t *boxes;
-	GLfloat rgba[4];
-	int count;
-
-	if (!renderer->target_texture)
-		return;
-
-	color_to_gl(color, rgba);
-	glDisable(GL_BLEND);
-	glUseProgram(renderer->solid.program);
-	glUniformMatrix4fv(renderer->solid.proj, 1, GL_FALSE, renderer->proj);
-	glUniform4fv(renderer->solid.color, 1, rgba);
+	GLfloat *v;
+	int count, i;
 
 	boxes = pixman_region32_rectangles(region, &count);
-	while (count--) {
-		draw_quad(renderer->solid.pos, boxes->x1, boxes->y1, boxes->x2,
-		          boxes->y2);
-		++boxes;
+	if (count <= 0 || !bind_target(renderer))
+		return;
+	if (!(v = reserve_quads(renderer->context, count)))
+		return;
+
+	setup_solid(renderer, color);
+	for (i = 0; i < count; ++i) {
+		v = put_quad(v, boxes[i].x1, boxes[i].y1, boxes[i].x2, boxes[i].y2,
+		             0, 0, 0, 0);
 	}
+	draw_quads(renderer->context, count);
 }
 
 void
@@ -1316,10 +1610,13 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *src_base,
 	struct gles_renderer *renderer = gles_renderer(base);
 	GLfloat src_w = (GLfloat)src_base->base.width;
 	GLfloat src_h = (GLfloat)src_base->base.height;
+	GLfloat *v;
 
 	if (src_w <= 0.0f || src_h <= 0.0f)
 		return;
 	if (!setup_textured(renderer, src_base, true))
+		return;
+	if (!(v = reserve_quads(renderer->context, 1)))
 		return;
 
 	/*
@@ -1332,85 +1629,164 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *src_base,
 	 * buffer_texture() already asks for GL_LINEAR in both directions, so
 	 * there is no filter state to set here.
 	 */
-	draw_textured_quad(renderer, dst->x, dst->y,
-	                   dst->x + (int32_t)dst->width,
-	                   dst->y + (int32_t)dst->height,
-	                   (GLfloat)(src->x / src_w), (GLfloat)(src->y / src_h),
-	                   (GLfloat)((src->x + src->width) / src_w),
-	                   (GLfloat)((src->y + src->height) / src_h),
-	                   renderer->textured.pos, renderer->textured.texcoord);
-
-	glDisable(GL_BLEND);
+	put_quad(v, dst->x, dst->y, dst->x + (int32_t)dst->width,
+	         dst->y + (int32_t)dst->height,
+	         (GLfloat)(src->x / src_w), (GLfloat)(src->y / src_h),
+	         (GLfloat)((src->x + src->width) / src_w),
+	         (GLfloat)((src->y + src->height) / src_h));
+	draw_quads(renderer->context, 1);
 }
 
-/*
- * Glyphs are cached as individual GL_ALPHA textures in a small direct-mapped
- * table. Allocation serials avoid stale cache hits when a font is closed and
- * a later font's glyph reuses the same address.
- */
-static struct glyph_entry *
-glyph_texture(struct gles_renderer *renderer, struct glyph *glyph)
+/**** Glyph atlas ****/
+
+static bool
+atlas_create(struct gbm_context *context)
 {
-	FT_Bitmap *bitmap = &glyph->bitmap;
-	struct glyph_entry *entry;
-	uint8_t *pixels;
-	uint32_t row, col;
-	size_t index;
+	struct glyph_atlas *atlas = &context->atlas;
+	GLint max_size = 0;
+	uint8_t *zero;
 
-	index = glyph->serial % GLYPH_CACHE_SIZE;
-	entry = &renderer->glyphs[index];
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
+	atlas->size = GLYPH_ATLAS_SIZE;
+	if (max_size > 0 && (GLint)atlas->size > max_size)
+		atlas->size = max_size;
 
-	if (entry->serial == glyph->serial)
-		return entry->texture ? entry : NULL;
-
-	if (entry->texture)
-		glDeleteTextures(1, &entry->texture);
-	entry->serial = glyph->serial;
-	entry->texture = 0;
-	entry->width = bitmap->width;
-	entry->height = bitmap->rows;
-
-	if (bitmap->width == 0 || bitmap->rows == 0)
-		return NULL;
-
-	if (!(pixels = malloc((size_t)bitmap->width * bitmap->rows)))
-		return NULL;
-
-	switch (bitmap->pixel_mode) {
-	case FT_PIXEL_MODE_GRAY:
-		for (row = 0; row < bitmap->rows; ++row) {
-			memcpy(pixels + (size_t)row * bitmap->width,
-			       bitmap->buffer + (size_t)row * bitmap->pitch,
-			       bitmap->width);
-		}
-		break;
-	case FT_PIXEL_MODE_MONO:
-		for (row = 0; row < bitmap->rows; ++row) {
-			const uint8_t *src = bitmap->buffer + (size_t)row * bitmap->pitch;
-			uint8_t *dst = pixels + (size_t)row * bitmap->width;
-
-			for (col = 0; col < bitmap->width; ++col)
-				dst[col] = (src[col >> 3] & (0x80 >> (col & 7))) ? 0xff : 0x00;
-		}
-		break;
-	default:
-		free(pixels);
-		return NULL;
+	if (!(atlas->slots = calloc(GLYPH_TABLE_SIZE, sizeof *atlas->slots)))
+		return false;
+	/* Start blank, so padding never samples undefined texels. */
+	if (!(zero = calloc(atlas->size, atlas->size))) {
+		free(atlas->slots);
+		atlas->slots = NULL;
+		return false;
 	}
 
-	glGenTextures(1, &entry->texture);
-	glBindTexture(GL_TEXTURE_2D, entry->texture);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glGenTextures(1, &atlas->texture);
+	bind_texture(context, atlas->texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, bitmap->width, bitmap->rows, 0,
-	             GL_ALPHA, GL_UNSIGNED_BYTE, pixels);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, atlas->size, atlas->size, 0,
+	             GL_ALPHA, GL_UNSIGNED_BYTE, zero);
+	free(zero);
 
+	return true;
+}
+
+/*
+ * Forget every glyph. Draws already issued keep what they sampled: GL orders
+ * the uploads that later overwrite the texels after them.
+ */
+static void
+atlas_reset(struct glyph_atlas *atlas)
+{
+	memset(atlas->slots, 0, GLYPH_TABLE_SIZE * sizeof *atlas->slots);
+	atlas->count = 0;
+	atlas->shelf_x = atlas->shelf_y = atlas->shelf_height = 0;
+}
+
+enum glyph_result {
+	GLYPH_OK,
+	GLYPH_SKIP, /* nothing to draw for this glyph */
+	GLYPH_FULL, /* reset the atlas and ask again */
+};
+
+static uint8_t *
+glyph_alpha(const FT_Bitmap *bitmap)
+{
+	uint8_t *pixels;
+	uint32_t row, col;
+
+	if (bitmap->pixel_mode != FT_PIXEL_MODE_GRAY
+	    && bitmap->pixel_mode != FT_PIXEL_MODE_MONO)
+		return NULL;
+	if (!(pixels = malloc((size_t)bitmap->width * bitmap->rows)))
+		return NULL;
+
+	for (row = 0; row < bitmap->rows; ++row) {
+		const uint8_t *src = bitmap->buffer + (ptrdiff_t)row * bitmap->pitch;
+		uint8_t *dst = pixels + (size_t)row * bitmap->width;
+
+		if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
+			memcpy(dst, src, bitmap->width);
+			continue;
+		}
+		for (col = 0; col < bitmap->width; ++col)
+			dst[col] = (src[col >> 3] & (0x80 >> (col & 7))) ? 0xff : 0x00;
+	}
+
+	return pixels;
+}
+
+/*
+ * Find a glyph in the atlas, uploading it on a miss. Glyph serials are unique
+ * for the life of the process, so a font closed and another loaded at the same
+ * address can never hit a stale entry.
+ */
+static enum glyph_result
+atlas_glyph(struct gbm_context *context, struct glyph *glyph,
+            const struct glyph_slot **out)
+{
+	struct glyph_atlas *atlas = &context->atlas;
+	const FT_Bitmap *bitmap = &glyph->bitmap;
+	uint32_t width = bitmap->width, height = bitmap->rows;
+	struct glyph_slot *slot;
+	uint8_t *pixels;
+	size_t index;
+
+	if (width == 0 || height == 0)
+		return GLYPH_SKIP;
+	if (!atlas->slots && !atlas_create(context))
+		return GLYPH_SKIP;
+	/* Larger than the whole atlas: no amount of eviction makes room. */
+	if (width + GLYPH_PADDING > atlas->size
+	    || height + GLYPH_PADDING > atlas->size)
+		return GLYPH_SKIP;
+
+	index = (size_t)((glyph->serial * UINT64_C(0x9e3779b97f4a7c15)) >> 52)
+	        & (GLYPH_TABLE_SIZE - 1);
+	for (; atlas->slots[index].serial;
+	     index = (index + 1) & (GLYPH_TABLE_SIZE - 1)) {
+		if (atlas->slots[index].serial == glyph->serial) {
+			*out = &atlas->slots[index];
+			return GLYPH_OK;
+		}
+	}
+
+	if (atlas->count >= GLYPH_TABLE_LOAD)
+		return GLYPH_FULL;
+	if (atlas->shelf_x + width + GLYPH_PADDING > atlas->size) {
+		atlas->shelf_y += atlas->shelf_height;
+		atlas->shelf_x = 0;
+		atlas->shelf_height = 0;
+	}
+	if (atlas->shelf_y + height + GLYPH_PADDING > atlas->size)
+		return GLYPH_FULL;
+
+	if (!(pixels = glyph_alpha(bitmap)))
+		return GLYPH_SKIP;
+
+	bind_texture(context, atlas->texture);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, atlas->shelf_x, atlas->shelf_y, width,
+	                height, GL_ALPHA, GL_UNSIGNED_BYTE, pixels);
 	free(pixels);
 
-	return entry;
+	slot = &atlas->slots[index];
+	slot->serial = glyph->serial;
+	slot->x = atlas->shelf_x;
+	slot->y = atlas->shelf_y;
+	slot->width = width;
+	slot->height = height;
+	++atlas->count;
+
+	atlas->shelf_x += width + GLYPH_PADDING;
+	if (height + GLYPH_PADDING > atlas->shelf_height)
+		atlas->shelf_height = height + GLYPH_PADDING;
+
+	*out = slot;
+	return GLYPH_OK;
 }
 
 void
@@ -1419,28 +1795,45 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
                    struct wld_extents *extents)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
-	struct glyph_entry *entry;
+	struct gbm_context *context = renderer->context;
+	const struct glyph_slot *slot;
+	enum glyph_result result;
 	struct glyph *glyph;
 	FT_UInt glyph_index;
-	GLfloat rgba[4];
+	GLfloat rgba[4], scale;
 	uint32_t origin_x = 0, c;
+	size_t quads = 0;
+	GLfloat *v;
 	int ret;
-
-	if (!renderer->target_texture)
-		return;
 
 	if (length == -1)
 		length = strlen(text);
 
-	color_to_gl(color, rgba);
+	/* The advance is still owed to the caller when there is nothing to draw
+	 * into, so a missing target only suppresses the drawing. */
+	if (!bind_target(renderer)
+	    || (!context->atlas.slots && !atlas_create(context))) {
+		while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0
+		       && c != '\0') {
+			text += ret;
+			length -= ret;
+			glyph_index = FT_Get_Char_Index(font->face, c);
+			if (font_ensure_glyph(font, glyph_index))
+				origin_x += font->glyphs[glyph_index]->advance;
+		}
+		goto done;
+	}
 
-	glUseProgram(renderer->glyph.program);
-	glUniformMatrix4fv(renderer->glyph.proj, 1, GL_FALSE, renderer->proj);
-	glUniform4fv(renderer->glyph.color, 1, rgba);
-	glActiveTexture(GL_TEXTURE0);
-	glUniform1i(renderer->glyph.tex, 0);
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	scale = 1.0f / (GLfloat)context->atlas.size;
+
+	color_to_gl(color, rgba);
+	use_program(context, renderer->glyph.program);
+	load_projection(renderer, renderer->glyph.proj,
+	                &renderer->glyph.proj_valid);
+	load_color(renderer->glyph.color, rgba, renderer->glyph.color_value,
+	           &renderer->glyph.color_valid);
+	bind_texture(context, context->atlas.texture);
+	set_blend(context, true);
 
 	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0 && c != '\0') {
 		text += ret;
@@ -1451,23 +1844,32 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 			continue;
 
 		glyph = font->glyphs[glyph_index];
+		result = atlas_glyph(context, glyph, &slot);
+		if (result == GLYPH_FULL) {
+			/* Draw what already points into the atlas before reusing it. */
+			draw_quads(context, quads);
+			quads = 0;
+			atlas_reset(&context->atlas);
+			result = atlas_glyph(context, glyph, &slot);
+		}
 
-		if ((entry = glyph_texture(renderer, glyph))) {
-			int32_t gx = x + (int32_t)origin_x + glyph->x;
-			int32_t gy = y + glyph->y;
+		if (result == GLYPH_OK && (v = reserve_quads(context, quads + 1))) {
+			GLfloat gx = x + (int32_t)origin_x + glyph->x;
+			GLfloat gy = y + glyph->y;
 
-			glBindTexture(GL_TEXTURE_2D, entry->texture);
-			draw_textured_quad(renderer, gx, gy, gx + (int32_t)entry->width,
-			                   gy + (int32_t)entry->height, 0.0f, 0.0f, 1.0f,
-			                   1.0f, renderer->glyph.pos,
-			                   renderer->glyph.texcoord);
+			put_quad(v + quads * QUAD_FLOATS, gx, gy, gx + slot->width,
+			         gy + slot->height, slot->x * scale, slot->y * scale,
+			         (slot->x + slot->width) * scale,
+			         (slot->y + slot->height) * scale);
+			++quads;
 		}
 
 		origin_x += glyph->advance;
 	}
 
-	glDisable(GL_BLEND);
+	draw_quads(context, quads);
 
+done:
 	if (extents)
 		extents->advance = origin_x;
 }
@@ -1480,7 +1882,7 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
 	struct gles_renderer *renderer = gles_renderer(base);
 	uint64_t row_bytes = (uint64_t)width * 4;
 
-	if (!renderer->target_texture || !data || x < 0 || y < 0 ||
+	if (!bind_target(renderer) || !data || x < 0 || y < 0 ||
 	    width == 0 || height == 0 || pitch < row_bytes ||
 	    (uint64_t)x + width > renderer->target_width ||
 	    (uint64_t)y + height > renderer->target_height)
@@ -1528,12 +1930,10 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
  *    stops working, which removes the very wait it exists to perform.
  *
  * So run one full create/wait/destroy cycle with both questions instrumented,
- * and act on the answers from then on. Where the wait leaks, fall back to
- * waiting on the descriptor itself: a sync_file becomes readable when its
- * fence signals, so poll() is an exact wait for the same event. It blocks the
- * caller rather than only ordering GPU commands, which is a real cost, but by
- * the time a compositor composites a frame the client's rendering is normally
- * already complete and the wait returns at once.
+ * and act on the answers from then on. Where the wait leaks, only report
+ * whether the fence has already signalled: a sync_file becomes readable when
+ * its fence signals, so the caller can wait for exactly that event in its own
+ * event loop instead of blocking here.
  */
 enum fence_fd_ownership {
 	FENCE_FD_UNKNOWN,
@@ -1583,18 +1983,17 @@ same_open_file(int fd, const struct stat *before)
 	       && now.st_ino == before->st_ino;
 }
 
-/* A sync_file signals by becoming readable. */
+/* A sync_file signals by becoming readable. This only looks; it never waits. */
 static bool
-wait_fence_fd(int fence_fd)
+fence_signalled(int fence_fd)
 {
 	struct pollfd pollfd = {.fd = fence_fd, .events = POLLIN};
 	int ret;
 
 	do {
-		ret = poll(&pollfd, 1, FENCE_WAIT_MS);
+		ret = poll(&pollfd, 1, 0);
 	} while (ret < 0 && errno == EINTR);
 
-	/* A fence that never signals must not wedge the caller for good. */
 	return ret > 0;
 }
 
@@ -1617,7 +2016,7 @@ renderer_wait_fence(struct wld_renderer *base, int fence_fd)
 		return true;
 
 	if (gpu_wait_leaks)
-		return wait_fence_fd(fence_fd);
+		return fence_signalled(fence_fd);
 
 	probing = !fence_behavior_known;
 	/* Counted before our own duplicate exists, and compared after it is gone
@@ -1684,28 +2083,78 @@ renderer_wait_fence(struct wld_renderer *base, int fence_fd)
 	return waited;
 }
 
+int
+renderer_export_fence(struct wld_renderer *base)
+{
+	struct gbm_context *context = gles_renderer(base)->context;
+	EGLint attribs[] = {
+		EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID,
+		EGL_NONE
+	};
+	EGLSyncKHR sync;
+	int fd;
+
+	if (context->has_native_fence) {
+		sync = context->create_sync(context->display,
+		                            EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+		if (sync != EGL_NO_SYNC_KHR) {
+			/* The fence only gets a descriptor once it has been flushed. */
+			glFlush();
+			fd = context->dup_native_fence_fd(context->display, sync);
+			context->destroy_sync(context->display, sync);
+			if (fd >= 0)
+				return fd;
+		}
+	}
+
+	glFinish();
+	context->unfinished = false;
+	return -1;
+}
+
 void
 renderer_flush(struct wld_renderer *base)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
+	struct gbm_context *context = renderer->context;
+	struct wld_buffer *target = base->target;
 
-	(void)renderer;
 	/*
-	 * Callers use flush() as a barrier before handing a buffer to KMS or
-	 * reading it on the CPU, so this has to be a real finish, not glFlush.
+	 * A scanout buffer goes to KMS, and whatever hands it over waits on
+	 * wld_export_fence() first, so submitting the work is enough; waiting for
+	 * it here would stall the caller for a whole GPU frame. Anything else may
+	 * be read by the CPU or by another process with no fence to go by, so
+	 * flush() stays a real finish for those.
 	 */
+	if (context->has_native_fence && target
+	    && target->impl == &wld_buffer_impl
+	    && gbm_buffer(target)->scanout) {
+		glFlush();
+		context->unfinished = true;
+		return;
+	}
+
 	glFinish();
+	context->unfinished = false;
 }
 
 void
 renderer_destroy(struct wld_renderer *base)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
-	size_t i;
+	struct gbm_context *context = renderer->context;
 
-	for (i = 0; i < GLYPH_CACHE_SIZE; ++i) {
-		if (renderer->glyphs[i].texture)
-			glDeleteTextures(1, &renderer->glyphs[i].texture);
+	/* A deleted name can come back from the next glCreateProgram or
+	 * glGenFramebuffers, so the cache must not keep claiming it is bound. */
+	if (context->gl.program == renderer->solid.program
+	    || context->gl.program == renderer->textured.program
+	    || context->gl.program == renderer->glyph.program) {
+		glUseProgram(0);
+		context->gl.program = 0;
+	}
+	if (context->gl.fbo == renderer->fbo) {
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		context->gl.fbo = 0;
 	}
 
 	glDeleteProgram(renderer->solid.program);
@@ -1735,32 +2184,28 @@ context_create_renderer(struct wld_context *base)
 		goto error;
 	}
 
-	renderer->solid.pos = glGetAttribLocation(renderer->solid.program, "pos");
 	renderer->solid.proj = glGetUniformLocation(renderer->solid.program, "proj");
 	renderer->solid.color =
 	    glGetUniformLocation(renderer->solid.program, "color");
 
-	renderer->textured.pos =
-	    glGetAttribLocation(renderer->textured.program, "pos");
-	renderer->textured.texcoord =
-	    glGetAttribLocation(renderer->textured.program, "texcoord");
 	renderer->textured.proj =
 	    glGetUniformLocation(renderer->textured.program, "proj");
-	renderer->textured.tex =
-	    glGetUniformLocation(renderer->textured.program, "tex");
 	renderer->textured.mul =
 	    glGetUniformLocation(renderer->textured.program, "mul");
 	renderer->textured.add =
 	    glGetUniformLocation(renderer->textured.program, "add");
+	renderer->textured.opaque = -1;
 
-	renderer->glyph.pos = glGetAttribLocation(renderer->glyph.program, "pos");
-	renderer->glyph.texcoord =
-	    glGetAttribLocation(renderer->glyph.program, "texcoord");
 	renderer->glyph.proj =
 	    glGetUniformLocation(renderer->glyph.program, "proj");
-	renderer->glyph.tex = glGetUniformLocation(renderer->glyph.program, "tex");
 	renderer->glyph.color =
 	    glGetUniformLocation(renderer->glyph.program, "color");
+
+	/* Both texturing programs only ever sample unit 0. */
+	use_program(context, renderer->textured.program);
+	glUniform1i(glGetUniformLocation(renderer->textured.program, "tex"), 0);
+	use_program(context, renderer->glyph.program);
+	glUniform1i(glGetUniformLocation(renderer->glyph.program, "tex"), 0);
 
 	glGenFramebuffers(1, &renderer->fbo);
 

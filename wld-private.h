@@ -152,10 +152,16 @@ struct wld_renderer_impl {
 	                    void *data);
 	/**
 	 * Optional. Orders subsequent rendering after a DRM sync_file fence,
-	 * without consuming the caller's file descriptor. A negative fence_fd
-	 * only probes support. NULL when the backend has no notion of fences.
+	 * without consuming the caller's file descriptor, and without blocking.
+	 * A negative fence_fd only probes support. NULL when the backend has no
+	 * notion of fences.
 	 */
 	bool (*wait_fence)(struct wld_renderer *renderer, int fence_fd);
+	/**
+	 * Optional. Submits all rendering so far and returns a sync_file that
+	 * signals when it completes, or -1 once it has completed instead.
+	 */
+	int (*export_fence)(struct wld_renderer *renderer);
 	void (*destroy)(struct wld_renderer *renderer);
 };
 
@@ -171,6 +177,14 @@ struct wld_buffer_impl {
 	bool (*map)(struct buffer *buffer);
 	bool (*unmap)(struct buffer *buffer);
 	void (*flush)(struct buffer *buffer);
+	/**
+	 * Optional. Told, ahead of flush(), which part of the buffer a CPU
+	 * renderer wrote since it became the target, so a backend that mirrors
+	 * the pixels elsewhere can refresh only that part. NULL means the writes
+	 * could have gone anywhere. A flush() with no damage() before it must
+	 * still assume the whole buffer changed.
+	 */
+	void (*damage)(struct buffer *buffer, pixman_region32_t *region);
 	void (*destroy)(struct buffer *buffer);
 };
 

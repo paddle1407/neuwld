@@ -38,6 +38,15 @@ struct pixman_renderer {
 	struct wld_renderer base;
 	pixman_image_t *target;
 	pixman_glyph_cache_t *glyph_cache;
+
+	/*
+	 * What has been drawn into the target since it was set, reported to the
+	 * buffer on flush so a GPU backend re-uploads only that. damage_all is
+	 * for drawing whose extent is not worth working out.
+	 */
+	struct buffer *target_buffer;
+	pixman_region32_t damage;
+	bool damage_all;
 };
 
 struct pixman_buffer {
@@ -77,6 +86,9 @@ context_create_renderer(struct wld_context *context)
 
 	renderer_initialize(&renderer->base, &wld_renderer_impl);
 	renderer->target = NULL;
+	renderer->target_buffer = NULL;
+	pixman_region32_init(&renderer->damage);
+	renderer->damage_all = false;
 
 	return &renderer->base;
 
@@ -259,11 +271,26 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	if (renderer->target)
 		pixman_image_unref(renderer->target);
 
-	if (buffer)
-		return (renderer->target = pixman_image(buffer));
+	pixman_region32_clear(&renderer->damage);
+	renderer->damage_all = false;
+	renderer->target_buffer = buffer;
+
+	if (buffer) {
+		if (!(renderer->target = pixman_image(buffer)))
+			renderer->target_buffer = NULL;
+		return renderer->target;
+	}
 
 	renderer->target = NULL;
 	return true;
+}
+
+static void
+add_damage_rect(struct pixman_renderer *renderer, int32_t x, int32_t y,
+                uint32_t width, uint32_t height)
+{
+	pixman_region32_union_rect(&renderer->damage, &renderer->damage, x, y,
+	                           width, height);
 }
 
 void
@@ -277,6 +304,7 @@ renderer_fill_rectangle(struct wld_renderer *base, uint32_t color,
 
 	pixman_image_fill_boxes(PIXMAN_OP_SRC, renderer->target,
 	                        &pixman_color, 1, &box);
+	add_damage_rect(renderer, x, y, width, height);
 }
 
 void
@@ -291,6 +319,7 @@ renderer_fill_region(struct wld_renderer *base, uint32_t color,
 	boxes = pixman_region32_rectangles(region, &num_boxes);
 	pixman_image_fill_boxes(PIXMAN_OP_SRC, renderer->target,
 	                        &pixman_color, num_boxes, boxes);
+	pixman_region32_union(&renderer->damage, &renderer->damage, region);
 }
 
 void
@@ -308,6 +337,7 @@ renderer_copy_rectangle(struct wld_renderer *base, struct buffer *buffer,
 	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, dst,
 	                         src_x, src_y, 0, 0, dst_x, dst_y, width, height);
 	pixman_image_unref(src);
+	add_damage_rect(renderer, dst_x, dst_y, width, height);
 }
 
 void
@@ -336,6 +366,7 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
 	pixman_image_unref(src);
 	pixman_image_set_clip_region32(dst, NULL);
 
+	pixman_region32_union(&renderer->damage, &renderer->damage, &clip);
 	pixman_region32_fini(&clip);
 }
 
@@ -369,6 +400,7 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *buffer,
 	pixman_image_set_transform(source, NULL);
 	pixman_image_set_filter(source, PIXMAN_FILTER_NEAREST, NULL, 0);
 	pixman_image_unref(source);
+	add_damage_rect(renderer, dst->x, dst->y, dst->width, dst->height);
 }
 
 static inline uint8_t
@@ -507,6 +539,8 @@ renderer_draw_text(struct wld_renderer *base,
 	pixman_composite_glyphs_no_mask(PIXMAN_OP_OVER, solid, renderer->target,
 	                                0, 0, x, y, renderer->glyph_cache,
 	                                index, glyphs);
+	/* Glyph extents reach above and below the baseline; not worth tracking. */
+	renderer->damage_all = true;
 
 	free(glyphs);
 	pixman_image_unref(solid);
@@ -516,8 +550,20 @@ renderer_draw_text(struct wld_renderer *base,
 }
 
 void
-renderer_flush(struct wld_renderer *renderer)
+renderer_flush(struct wld_renderer *base)
 {
+	struct pixman_renderer *renderer = pixman_renderer(base);
+	struct buffer *buffer = renderer->target_buffer;
+
+	/* The drawing itself is already done; only the report is left. */
+	if (!buffer || !buffer->base.impl->damage)
+		return;
+
+	buffer->base.impl->damage(buffer, renderer->damage_all
+	                                      ? NULL
+	                                      : &renderer->damage);
+	pixman_region32_clear(&renderer->damage);
+	renderer->damage_all = false;
 }
 
 void
@@ -526,6 +572,7 @@ renderer_destroy(struct wld_renderer *base)
 	struct pixman_renderer *renderer = pixman_renderer(base);
 
 	pixman_glyph_cache_destroy(renderer->glyph_cache);
+	pixman_region32_fini(&renderer->damage);
 	free(renderer);
 }
 
