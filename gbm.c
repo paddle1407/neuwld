@@ -55,12 +55,6 @@
 
 #include <fontconfig/fontconfig.h>
 
-/*
- * How long a direct wait on a fence descriptor may block. A client that
- * never signals must not wedge the caller; one frame at 60Hz is 16ms.
- */
-#define FENCE_WAIT_MS 50
-
 /* Past this many boxes, a dirty region is uploaded as its bounding box. */
 #define DIRTY_BOX_LIMIT 16
 
@@ -1936,12 +1930,10 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
  *    stops working, which removes the very wait it exists to perform.
  *
  * So run one full create/wait/destroy cycle with both questions instrumented,
- * and act on the answers from then on. Where the wait leaks, fall back to
- * waiting on the descriptor itself: a sync_file becomes readable when its
- * fence signals, so poll() is an exact wait for the same event. It blocks the
- * caller rather than only ordering GPU commands, which is a real cost, but by
- * the time a compositor composites a frame the client's rendering is normally
- * already complete and the wait returns at once.
+ * and act on the answers from then on. Where the wait leaks, only report
+ * whether the fence has already signalled: a sync_file becomes readable when
+ * its fence signals, so the caller can wait for exactly that event in its own
+ * event loop instead of blocking here.
  */
 enum fence_fd_ownership {
 	FENCE_FD_UNKNOWN,
@@ -1991,18 +1983,17 @@ same_open_file(int fd, const struct stat *before)
 	       && now.st_ino == before->st_ino;
 }
 
-/* A sync_file signals by becoming readable. */
+/* A sync_file signals by becoming readable. This only looks; it never waits. */
 static bool
-wait_fence_fd(int fence_fd)
+fence_signalled(int fence_fd)
 {
 	struct pollfd pollfd = {.fd = fence_fd, .events = POLLIN};
 	int ret;
 
 	do {
-		ret = poll(&pollfd, 1, FENCE_WAIT_MS);
+		ret = poll(&pollfd, 1, 0);
 	} while (ret < 0 && errno == EINTR);
 
-	/* A fence that never signals must not wedge the caller for good. */
 	return ret > 0;
 }
 
@@ -2025,7 +2016,7 @@ renderer_wait_fence(struct wld_renderer *base, int fence_fd)
 		return true;
 
 	if (gpu_wait_leaks)
-		return wait_fence_fd(fence_fd);
+		return fence_signalled(fence_fd);
 
 	probing = !fence_behavior_known;
 	/* Counted before our own duplicate exists, and compared after it is gone

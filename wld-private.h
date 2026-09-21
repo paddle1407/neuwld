@@ -152,8 +152,9 @@ struct wld_renderer_impl {
 	                    void *data);
 	/**
 	 * Optional. Orders subsequent rendering after a DRM sync_file fence,
-	 * without consuming the caller's file descriptor. A negative fence_fd
-	 * only probes support. NULL when the backend has no notion of fences.
+	 * without consuming the caller's file descriptor, and without blocking.
+	 * A negative fence_fd only probes support. NULL when the backend has no
+	 * notion of fences.
 	 */
 	bool (*wait_fence)(struct wld_renderer *renderer, int fence_fd);
 	/**
