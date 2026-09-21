@@ -28,16 +28,29 @@
 #include <stdlib.h>
 #include <wayland-client.h>
 
+struct wayland_buffer_socket;
+
 struct wayland_buffer {
 	struct wld_exporter exporter;
 	struct wld_destructor destructor;
 	struct wl_buffer *wl;
+	struct buffer *buffer;
+
+	/*
+	 * The socket this buffer was last attached through, which is where its
+	 * release goes. Cleared when that socket is destroyed, so a release
+	 * arriving for a buffer that outlived its surface is dropped rather than
+	 * delivered to freed memory.
+	 */
+	struct wayland_buffer_socket *socket;
+	struct wl_list link;
 };
 
 struct wayland_buffer_socket {
 	struct buffer_socket base;
-	struct wl_buffer_listener listener;
 	struct wld_surface *surface;
+	/* struct wayland_buffer.link of every buffer attached through us. */
+	struct wl_list buffers;
 	struct wl_surface *wl;
 	struct wl_display *display;
 	struct wl_event_queue *queue;
@@ -57,6 +70,10 @@ static const struct buffer_socket_impl buffer_socket_impl = {
 IMPL(wayland_buffer_socket, buffer_socket)
 
 static void buffer_release(void *data, struct wl_buffer *buffer);
+
+static const struct wl_buffer_listener buffer_listener = {
+	.release = &buffer_release,
+};
 
 const static struct wayland_impl *impls[] = {
 #if WITH_WAYLAND_DRM
@@ -163,7 +180,7 @@ wld_wayland_create_surface(struct wld_context *context,
 		goto error0;
 
 	socket->base.impl = &buffer_socket_impl;
-	socket->listener.release = &buffer_release;
+	wl_list_init(&socket->buffers);
 	socket->wl = wl;
 	socket->queue = ((struct wayland_context *)context)->queue;
 	socket->display = ((struct wayland_context *)context)->display;
@@ -211,6 +228,8 @@ buffer_destroy(struct wld_destructor *destructor)
 {
 	struct wayland_buffer *wayland_buffer = CONTAINER_OF(destructor, struct wayland_buffer, destructor);
 
+	if (wayland_buffer->socket)
+		wl_list_remove(&wayland_buffer->link);
 	wl_buffer_destroy(wayland_buffer->wl);
 	free(wayland_buffer);
 }
@@ -224,6 +243,17 @@ wayland_buffer_add_exporter(struct buffer *buffer, struct wl_buffer *wl)
 		return false;
 
 	wayland_buffer->wl = wl;
+	wayland_buffer->buffer = buffer;
+	wayland_buffer->socket = NULL;
+	/*
+	 * One listener per wl_buffer, registered here where the wl_buffer is
+	 * created, so the release handler finds its buffer through its own data
+	 * rather than through whichever socket happened to attach it first.
+	 */
+	if (wl_buffer_add_listener(wl, &buffer_listener, wayland_buffer) != 0) {
+		free(wayland_buffer);
+		return false;
+	}
 	wayland_buffer->exporter.export = &buffer_export;
 	wld_buffer_add_exporter(&buffer->base, &wayland_buffer->exporter);
 	wayland_buffer->destructor.destroy = &buffer_destroy;
@@ -236,6 +266,7 @@ bool
 buffer_socket_attach(struct buffer_socket *base, struct buffer *buffer)
 {
 	struct wayland_buffer_socket *socket = wayland_buffer_socket(base);
+	struct wayland_buffer *wayland_buffer;
 	struct wl_buffer *wl;
 	union wld_object object;
 
@@ -244,8 +275,17 @@ buffer_socket_attach(struct buffer_socket *base, struct buffer *buffer)
 
 	wl = object.ptr;
 
-	if (!wl_proxy_get_listener((struct wl_proxy *)wl))
-		wl_buffer_add_listener(wl, &socket->listener, buffer);
+	/* Every wl_buffer we export was given our listener when it was made. */
+	if (wl_proxy_get_listener((struct wl_proxy *)wl) != (void *)&buffer_listener)
+		return false;
+
+	wayland_buffer = wl_proxy_get_user_data((struct wl_proxy *)wl);
+	if (wayland_buffer->socket != socket) {
+		if (wayland_buffer->socket)
+			wl_list_remove(&wayland_buffer->link);
+		wl_list_insert(&socket->buffers, &wayland_buffer->link);
+		wayland_buffer->socket = socket;
+	}
 
 	wl_surface_attach(socket->wl, wl, 0, 0);
 
@@ -278,17 +318,27 @@ buffer_socket_process(struct buffer_socket *base)
 }
 
 void
-buffer_socket_destroy(struct buffer_socket *socket)
+buffer_socket_destroy(struct buffer_socket *base)
 {
+	struct wayland_buffer_socket *socket = wayland_buffer_socket(base);
+	struct wayland_buffer *wayland_buffer, *next;
+
+	/* Buffers can outlive the surface; their releases now have nowhere to go. */
+	wl_list_for_each_safe(wayland_buffer, next, &socket->buffers, link) {
+		wl_list_remove(&wayland_buffer->link);
+		wayland_buffer->socket = NULL;
+	}
+
 	free(socket);
 }
 
 void
 buffer_release(void *data, struct wl_buffer *wl)
 {
-	struct wld_buffer *buffer = data;
-	const struct wl_buffer_listener *listener = wl_proxy_get_listener((struct wl_proxy *)wl);
-	struct wayland_buffer_socket *socket = CONTAINER_OF(listener, struct wayland_buffer_socket, listener);
+	struct wayland_buffer *wayland_buffer = data;
 
-	wld_surface_release(socket->surface, buffer);
+	(void)wl;
+	if (wayland_buffer->socket)
+		wld_surface_release(wayland_buffer->socket->surface,
+		                    &wayland_buffer->buffer->base);
 }
