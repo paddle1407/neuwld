@@ -26,6 +26,9 @@ static bool buffer_unmap(struct buffer *drawable);
 #ifdef BUFFER_IMPLEMENTS_FLUSH
 static void buffer_flush(struct buffer *drawable);
 #endif
+#ifdef BUFFER_IMPLEMENTS_DAMAGE
+static void buffer_damage(struct buffer *drawable, pixman_region32_t *region);
+#endif
 static void buffer_destroy(struct buffer *drawable);
 
 static const struct wld_buffer_impl wld_buffer_impl = {
@@ -33,6 +36,9 @@ static const struct wld_buffer_impl wld_buffer_impl = {
 	.unmap = &buffer_unmap,
 #ifdef BUFFER_IMPLEMENTS_FLUSH
 	.flush = &buffer_flush,
+#endif
+#ifdef BUFFER_IMPLEMENTS_DAMAGE
+	.damage = &buffer_damage,
 #endif
 	.destroy = &buffer_destroy
 };

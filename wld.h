@@ -313,14 +313,31 @@ void wld_blend_scaled(struct wld_renderer *renderer,
  * driver among them -- give no other way to know that a client has finished
  * drawing into a buffer before it is sampled.
  *
+ * This never blocks. Where the GPU cannot be made to wait, it only reports
+ * whether the fence has already signalled, and a false return leaves the
+ * caller to wait for the descriptor to become readable some other way.
+ *
  * The fence is not consumed: the caller keeps ownership of fence_fd and must
  * close it. A negative fence_fd probes whether the backend can wait on fences
  * at all, without waiting on anything.
  *
- * Returns false if the backend cannot wait on fences, or if this fence could
- * not be waited on.
+ * Returns false if the backend cannot wait on fences, or if rendering is not
+ * yet ordered after this one.
  */
 bool wld_wait_fence(struct wld_renderer *renderer, int fence_fd);
+
+/**
+ * Submit all rendering so far and return a DRM sync_file that signals when the
+ * GPU has finished it. The caller owns the descriptor.
+ *
+ * Returns -1 when the backend cannot make one, in which case the rendering is
+ * already complete when this returns.
+ *
+ * wld_flush() of a buffer created with WLD_DRM_FLAG_SCANOUT only submits the
+ * rendering on a backend that can export fences, so whatever displays such a
+ * buffer must wait for this fence first.
+ */
+int wld_export_fence(struct wld_renderer *renderer);
 
 void wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
 				int32_t x, int32_t y, uint32_t r, bool fill);
