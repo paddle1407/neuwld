@@ -171,6 +171,14 @@ struct wld_buffer_impl {
 	bool (*map)(struct buffer *buffer);
 	bool (*unmap)(struct buffer *buffer);
 	void (*flush)(struct buffer *buffer);
+	/**
+	 * Optional. Told, ahead of flush(), which part of the buffer a CPU
+	 * renderer wrote since it became the target, so a backend that mirrors
+	 * the pixels elsewhere can refresh only that part. NULL means the writes
+	 * could have gone anywhere. A flush() with no damage() before it must
+	 * still assume the whole buffer changed.
+	 */
+	void (*damage)(struct buffer *buffer, pixman_region32_t *region);
 	void (*destroy)(struct buffer *buffer);
 };
 

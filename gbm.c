@@ -61,6 +61,9 @@
  */
 #define FENCE_WAIT_MS 50
 
+/* Past this many boxes, a dirty region is uploaded as its bounding box. */
+#define DIRTY_BOX_LIMIT 16
+
 /* Number of glyph textures cached per renderer. */
 #define GLYPH_CACHE_SIZE 512
 
@@ -126,7 +129,16 @@ struct gbm_buffer {
 	bool dumb;
 	bool tex_allocated;
 	size_t mapping_size;
+
+	/*
+	 * What of a CPU buffer's texture is stale. `dirty` covers all of it;
+	 * otherwise only `dirty_region` has to be uploaded again. A CPU renderer
+	 * reports what it drew through buffer_damage() before it flushes, and
+	 * `damage_reported` tells that flush it need not assume the worst.
+	 */
 	bool dirty;
+	bool damage_reported;
+	pixman_region32_t dirty_region;
 };
 
 struct gles_renderer {
@@ -156,6 +168,7 @@ struct gles_renderer {
 
 #define CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
 #define BUFFER_IMPLEMENTS_FLUSH
+#define BUFFER_IMPLEMENTS_DAMAGE
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND
 #define RENDERER_IMPLEMENTS_BLEND_SCALED
@@ -595,6 +608,7 @@ new_buffer(struct gbm_context *context, struct gbm_bo *bo, EGLImageKHR image,
 	buffer->handle = handle;
 	buffer->own_handle = own_handle;
 	buffer->map_data = NULL;
+	pixman_region32_init(&buffer->dirty_region);
 	buffer->exporter.export = &export;
 	wld_buffer_add_exporter(&buffer->base.base, &buffer->exporter);
 
@@ -924,16 +938,41 @@ buffer_unmap(struct buffer *base)
 }
 
 void
+buffer_damage(struct buffer *base, pixman_region32_t *region)
+{
+	struct gbm_buffer *buffer = gbm_buffer(&base->base);
+
+	if (!buffer->cpu)
+		return;
+
+	buffer->damage_reported = true;
+	if (!region) {
+		buffer->dirty = true;
+		return;
+	}
+
+	pixman_region32_union(&buffer->dirty_region, &buffer->dirty_region,
+	                      region);
+	pixman_region32_intersect_rect(&buffer->dirty_region,
+	                               &buffer->dirty_region, 0, 0,
+	                               base->base.width, base->base.height);
+}
+
+void
 buffer_flush(struct buffer *base)
 {
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
 	/*
 	 * Called once the renderer targeting this buffer is done with it, which
-	 * for a dumb buffer means the CPU has just finished drawing into it.
+	 * for a CPU buffer means the CPU has just finished drawing into it. Unless
+	 * that renderer said where, it could have been anywhere.
 	 */
-	if (buffer->cpu)
-		buffer->dirty = true;
+	if (buffer->cpu) {
+		if (!buffer->damage_reported)
+			buffer->dirty = true;
+		buffer->damage_reported = false;
+	}
 }
 
 void
@@ -943,6 +982,7 @@ buffer_destroy(struct buffer *base)
 
 	if (buffer->texture)
 		glDeleteTextures(1, &buffer->texture);
+	pixman_region32_fini(&buffer->dirty_region);
 
 	if (buffer->cpu) {
 		if (buffer->dumb) {
@@ -979,6 +1019,50 @@ buffer_destroy(struct buffer *base)
 
 /**** Renderer ****/
 
+/*
+ * Copy one box of a CPU buffer's pixels into its texture, which is bound.
+ *
+ * GLES2 has no GL_UNPACK_ROW_LENGTH, so without GL_EXT_unpack_subimage the
+ * rows of a box narrower than the pitch cannot be uploaded in one call.
+ */
+static void
+upload_box(struct gbm_buffer *buffer, const pixman_box32_t *box)
+{
+	uint32_t pitch = buffer->base.base.pitch;
+	uint32_t row_pixels = pitch / 4;
+	int32_t x = box->x1, y = box->y1;
+	int32_t width = box->x2 - box->x1, height = box->y2 - box->y1;
+	const uint8_t *pixels = buffer->base.base.map;
+
+	if (width <= 0 || height <= 0)
+		return;
+
+	if (row_pixels == (uint32_t)width) {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
+		                GL_UNSIGNED_BYTE, pixels + (size_t)y * pitch);
+	} else if (buffer->context->has_unpack_subimage) {
+		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
+		                GL_UNSIGNED_BYTE,
+		                pixels + (size_t)y * pitch + (size_t)x * 4);
+		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+	} else if (row_pixels == buffer->base.base.width) {
+		/* Whole rows are contiguous, so widen the box to them. */
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, row_pixels, height,
+		                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+		                pixels + (size_t)y * pitch);
+	} else {
+		int32_t row;
+
+		for (row = 0; row < height; ++row) {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, x, y + row, width, 1,
+			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+			                pixels + (size_t)(y + row) * pitch
+			                    + (size_t)x * 4);
+		}
+	}
+}
+
 /* Lazily wrap a buffer's EGLImage in a GL texture. */
 static GLuint
 buffer_texture(struct gbm_buffer *buffer)
@@ -1004,11 +1088,12 @@ buffer_texture(struct gbm_buffer *buffer)
 	}
 
 	/* CPU-backed contents live in system memory and must be uploaded. */
-	if (buffer->cpu && (fresh || buffer->dirty)) {
+	if (buffer->cpu && (fresh || buffer->dirty
+	                    || pixman_region32_not_empty(&buffer->dirty_region))) {
 		uint32_t width = buffer->base.base.width;
 		uint32_t height = buffer->base.base.height;
-		uint32_t pitch = buffer->base.base.pitch;
-		uint32_t row_pixels = pitch / 4;
+		pixman_box32_t full = { 0, 0, width, height }, *boxes;
+		int count;
 
 		if (!buffer->base.base.map)
 			return 0;
@@ -1023,29 +1108,27 @@ buffer_texture(struct gbm_buffer *buffer)
 			buffer->tex_allocated = true;
 		}
 
-		if (row_pixels == width) {
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
-			                buffer->base.base.map);
-		} else if (buffer->context->has_unpack_subimage) {
-			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-			                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
-			                buffer->base.base.map);
-			glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+		if (fresh || buffer->dirty) {
+			boxes = &full;
+			count = 1;
 		} else {
-			/* GLES2 without GL_EXT_unpack_subimage cannot skip padding. */
-			uint32_t y;
-
-			for (y = 0; y < height; ++y) {
-				glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1, GL_BGRA_EXT,
-				                GL_UNSIGNED_BYTE,
-				                (uint8_t *)buffer->base.base.map
-				                    + (size_t)y * pitch);
+			boxes = pixman_region32_rectangles(&buffer->dirty_region, &count);
+			/*
+			 * A region fragmented into many small boxes costs more in calls
+			 * than the few extra bytes its bounding box would upload.
+			 */
+			if (count > DIRTY_BOX_LIMIT) {
+				boxes = pixman_region32_extents(&buffer->dirty_region);
+				count = 1;
 			}
 		}
 
+		while (count--) {
+			upload_box(buffer, boxes++);
+		}
+
 		buffer->dirty = false;
+		pixman_region32_clear(&buffer->dirty_region);
 	}
 
 	return buffer->texture;

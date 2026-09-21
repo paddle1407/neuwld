@@ -200,6 +200,11 @@ wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	                         extents->x1 + dst_x, extents->y1 + dst_y,
 	                         extents->x2 - extents->x1,
 	                         extents->y2 - extents->y1);
+	/* The renderer did not see this write, so report it on its behalf. */
+	if (((struct buffer *)renderer->target)->base.impl->damage) {
+		((struct buffer *)renderer->target)->base.impl->damage(
+		    (struct buffer *)renderer->target, &clip);
+	}
 	pixman_region32_fini(&clip);
 
 destroy:
