@@ -115,11 +115,19 @@ struct gbm_context {
 	PFNEGLCREATESYNCKHRPROC create_sync;
 	PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 	PFNEGLWAITSYNCKHRPROC wait_sync;
+	PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_native_fence_fd;
 
 	bool has_modifiers;
 	bool has_unpack_subimage;
 	/* Set when a client's DRM sync_file fence can be waited on by the GPU. */
 	bool has_fence_sync;
+	/* Set when our own rendering can be exported as a sync_file. */
+	bool has_native_fence;
+	/*
+	 * Set while rendering has been submitted without being waited for, which
+	 * a CPU mapping of one of our buffers has to catch up on first.
+	 */
+	bool unfinished;
 
 	/*
 	 * GL state belongs to the context, and every renderer created from it
@@ -169,6 +177,8 @@ struct gbm_buffer {
 	bool cpu;
 	bool dumb;
 	bool tex_allocated;
+	/* Allocated for KMS, which is fenced by wld_export_fence(), not flush. */
+	bool scanout;
 	size_t mapping_size;
 
 	/*
@@ -224,6 +234,7 @@ struct gles_renderer {
 #define RENDERER_IMPLEMENTS_BLEND_SCALED
 #define RENDERER_IMPLEMENTS_READ_PIXELS
 #define RENDERER_IMPLEMENTS_WAIT_FENCE
+#define RENDERER_IMPLEMENTS_EXPORT_FENCE
 #include "interface/buffer.h"
 #include "interface/context.h"
 #include "interface/renderer.h"
@@ -526,6 +537,10 @@ driver_create_context(int drm_fd)
 		    (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
 		context->has_fence_sync = context->create_sync
 		    && context->destroy_sync && context->wait_sync;
+		context->dup_native_fence_fd = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)
+		    eglGetProcAddress("eglDupNativeFenceFDANDROID");
+		context->has_native_fence =
+		    context->has_fence_sync && context->dup_native_fence_fd;
 	}
 	if (!context->has_fence_sync) {
 		fprintf(stderr, "wld: GBM has no EGL fence sync; explicit client "
@@ -870,6 +885,7 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	if (!buffer)
 		goto error1;
 
+	gbm_buffer(&buffer->base)->scanout = flags & WLD_DRM_FLAG_SCANOUT;
 	return buffer;
 
 error1:
@@ -1015,6 +1031,12 @@ buffer_map(struct buffer *base)
 	/* Imported client dmabufs are not CPU accessible through GBM. */
 	if (!buffer->bo)
 		return false;
+
+	/* The GPU may still be writing it; see renderer_flush(). */
+	if (buffer->context->unfinished) {
+		glFinish();
+		buffer->context->unfinished = false;
+	}
 
 	data = gbm_bo_map(buffer->bo, 0, 0, base->base.width, base->base.height,
 	                  GBM_BO_TRANSFER_READ_WRITE, &stride, &buffer->map_data);
@@ -2070,17 +2092,59 @@ renderer_wait_fence(struct wld_renderer *base, int fence_fd)
 	return waited;
 }
 
+int
+renderer_export_fence(struct wld_renderer *base)
+{
+	struct gbm_context *context = gles_renderer(base)->context;
+	EGLint attribs[] = {
+		EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID,
+		EGL_NONE
+	};
+	EGLSyncKHR sync;
+	int fd;
+
+	if (context->has_native_fence) {
+		sync = context->create_sync(context->display,
+		                            EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+		if (sync != EGL_NO_SYNC_KHR) {
+			/* The fence only gets a descriptor once it has been flushed. */
+			glFlush();
+			fd = context->dup_native_fence_fd(context->display, sync);
+			context->destroy_sync(context->display, sync);
+			if (fd >= 0)
+				return fd;
+		}
+	}
+
+	glFinish();
+	context->unfinished = false;
+	return -1;
+}
+
 void
 renderer_flush(struct wld_renderer *base)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
+	struct gbm_context *context = renderer->context;
+	struct wld_buffer *target = base->target;
 
-	(void)renderer;
 	/*
-	 * Callers use flush() as a barrier before handing a buffer to KMS or
-	 * reading it on the CPU, so this has to be a real finish, not glFlush.
+	 * A scanout buffer goes to KMS, and whatever hands it over waits on
+	 * wld_export_fence() first, so submitting the work is enough; waiting for
+	 * it here would stall the caller for a whole GPU frame. Anything else may
+	 * be read by the CPU or by another process with no fence to go by, so
+	 * flush() stays a real finish for those.
 	 */
+	if (context->has_native_fence && target
+	    && target->impl == &wld_buffer_impl
+	    && gbm_buffer(target)->scanout) {
+		glFlush();
+		context->unfinished = true;
+		return;
+	}
+
 	glFinish();
+	context->unfinished = false;
 }
 
 void

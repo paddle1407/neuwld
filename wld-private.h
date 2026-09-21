@@ -156,6 +156,11 @@ struct wld_renderer_impl {
 	 * only probes support. NULL when the backend has no notion of fences.
 	 */
 	bool (*wait_fence)(struct wld_renderer *renderer, int fence_fd);
+	/**
+	 * Optional. Submits all rendering so far and returns a sync_file that
+	 * signals when it completes, or -1 once it has completed instead.
+	 */
+	int (*export_fence)(struct wld_renderer *renderer);
 	void (*destroy)(struct wld_renderer *renderer);
 };
 

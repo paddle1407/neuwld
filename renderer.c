@@ -89,6 +89,17 @@ wld_wait_fence(struct wld_renderer *renderer, int fence_fd)
 }
 
 EXPORT
+int
+wld_export_fence(struct wld_renderer *renderer)
+{
+	/* Without a fence of its own, a backend's flush is already a barrier. */
+	if (!renderer->impl->export_fence)
+		return -1;
+
+	return renderer->impl->export_fence(renderer);
+}
+
+EXPORT
 bool
 wld_set_target_buffer(struct wld_renderer *renderer, struct wld_buffer *buffer)
 {
