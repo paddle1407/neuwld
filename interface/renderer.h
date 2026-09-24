@@ -25,6 +25,10 @@ static uint32_t renderer_capabilities(struct wld_renderer *renderer,
                                       struct buffer *buffer);
 static bool renderer_set_target(struct wld_renderer *renderer,
                                 struct buffer *buffer);
+#ifdef RENDERER_IMPLEMENTS_SET_CLIP
+static void renderer_set_clip(struct wld_renderer *renderer,
+                              const pixman_box32_t *box);
+#endif
 static void renderer_fill_rectangle(struct wld_renderer *renderer,
                                     uint32_t color, int32_t x, int32_t y,
                                     uint32_t width, uint32_t height);
@@ -76,6 +80,11 @@ static void renderer_destroy(struct wld_renderer *renderer);
 static const struct wld_renderer_impl wld_renderer_impl = {
 	.capabilities = &renderer_capabilities,
 	.set_target = &renderer_set_target,
+#ifdef RENDERER_IMPLEMENTS_SET_CLIP
+	.set_clip = &renderer_set_clip,
+#else
+	.set_clip = NULL,
+#endif
 	.fill_rectangle = &renderer_fill_rectangle,
 	.copy_rectangle = &renderer_copy_rectangle,
 #ifdef RENDERER_IMPLEMENTS_REGION

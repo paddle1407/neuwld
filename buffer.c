@@ -129,6 +129,19 @@ wld_unmap(struct wld_buffer *base)
 
 EXPORT
 bool
+wld_buffer_upload(struct wld_buffer *base, const void *pixels, uint32_t pitch,
+                  pixman_region32_t *region)
+{
+	struct buffer *buffer = (void *)base;
+
+	if (!buffer->base.impl->upload)
+		return false;
+
+	return buffer->base.impl->upload(buffer, pixels, pitch, region);
+}
+
+EXPORT
+bool
 wld_export(struct wld_buffer *base, uint32_t type, union wld_object *object)
 {
 	struct buffer *buffer = (void *)base;

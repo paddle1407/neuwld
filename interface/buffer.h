@@ -29,6 +29,10 @@ static void buffer_flush(struct buffer *drawable);
 #ifdef BUFFER_IMPLEMENTS_DAMAGE
 static void buffer_damage(struct buffer *drawable, pixman_region32_t *region);
 #endif
+#ifdef BUFFER_IMPLEMENTS_UPLOAD
+static bool buffer_upload(struct buffer *drawable, const void *pixels,
+                          uint32_t pitch, pixman_region32_t *region);
+#endif
 static void buffer_destroy(struct buffer *drawable);
 
 static const struct wld_buffer_impl wld_buffer_impl = {
@@ -39,6 +43,9 @@ static const struct wld_buffer_impl wld_buffer_impl = {
 #endif
 #ifdef BUFFER_IMPLEMENTS_DAMAGE
 	.damage = &buffer_damage,
+#endif
+#ifdef BUFFER_IMPLEMENTS_UPLOAD
+	.upload = &buffer_upload,
 #endif
 	.destroy = &buffer_destroy
 };

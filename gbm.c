@@ -73,8 +73,9 @@
 /* Fixed attribute locations, bound before linking, shared by all programs. */
 #define ATTRIB_POS 0
 #define ATTRIB_TEXCOORD 1
-/* Every vertex is x, y, s, t; a quad is two triangles. */
-#define VERTEX_FLOATS 4
+#define ATTRIB_COLOR 2
+/* Every vertex is x, y, s, t, r, g, b, a; a quad is two triangles. */
+#define VERTEX_FLOATS 8
 #define QUAD_FLOATS (6 * VERTEX_FLOATS)
 
 /* Keep window-sized CPU pixel storage out of malloc's retained heap arenas.
@@ -94,6 +95,8 @@ struct glyph_atlas {
 	unsigned count;
 	struct glyph_slot *slots;
 };
+
+struct gles_renderer;
 
 struct gbm_context {
 	struct wld_context base;
@@ -131,12 +134,38 @@ struct gbm_context {
 	struct {
 		GLuint program, texture, fbo;
 		int blend; /* -1 until first set */
+		int scissor; /* -1 until first set */
+		pixman_box32_t scissor_box;
 	} gl;
 
-	/* Quads are staged here and drawn in one call per batch. */
+	/*
+	 * Quads are staged here and drawn in one call per batch. A batch is
+	 * everything staged since the last draw, under the GL state it was staged
+	 * for; whatever would change that state draws the batch first, so calls
+	 * that share a program, texture and blend mode -- a titlebar's hundred
+	 * button pixels, a border's four sides -- cost one draw between them.
+	 */
 	GLuint vbo;
 	GLfloat *verts;
 	size_t verts_capacity; /* in quads */
+	struct {
+		struct gles_renderer *renderer;
+		GLuint program, texture;
+		bool blend;
+		size_t quads;
+	} batch;
+
+	/*
+	 * Counted up whenever work is queued on the GPU. A fence exported since
+	 * the last count still covers everything queued, so it is handed out
+	 * again rather than created anew for every buffer a client replaces.
+	 */
+	uint64_t submissions, fence_submissions;
+	int fence_fd;
+
+	/* Every renderer on this context, so that a texture being deleted can be
+	 * forgotten as a render target wherever it was one. */
+	struct gles_renderer *renderers;
 
 	struct glyph_atlas atlas;
 };
@@ -173,6 +202,9 @@ struct gbm_buffer {
 	bool tex_allocated;
 	/* Allocated for KMS, which is fenced by wld_export_fence(), not flush. */
 	bool scanout;
+	/* Pixels only ever arrive through wld_buffer_upload(): there is no CPU
+	 * copy of them here, so nothing to map and nothing to keep in step. */
+	bool upload_only;
 	size_t mapping_size;
 
 	/*
@@ -196,13 +228,14 @@ struct gles_renderer {
 
 	/*
 	 * Uniforms are program state, and the programs are this renderer's own,
-	 * so the values last loaded into them are tracked here.
+	 * so the values last loaded into them are tracked here. Colour is not a
+	 * uniform but a vertex attribute, so that fills of different colours can
+	 * share one draw.
 	 */
 	struct {
 		GLuint program;
-		GLint proj, color;
-		bool proj_valid, color_valid;
-		GLfloat color_value[4];
+		GLint proj;
+		bool proj_valid;
 	} solid;
 	struct {
 		GLuint program;
@@ -212,18 +245,26 @@ struct gles_renderer {
 	} textured;
 	struct {
 		GLuint program;
-		GLint proj, color;
-		bool proj_valid, color_valid;
-		GLfloat color_value[4];
+		GLint proj;
+		bool proj_valid;
 	} glyph;
 
 	GLfloat proj[16];
+
+	/* wld_set_clip(): a box outside of which nothing is drawn, until the
+	 * target changes. Applied as the scissor when this renderer draws. */
+	bool clip_enabled;
+	pixman_box32_t clip;
+
+	struct gles_renderer *next;
 };
 
 #define CONTEXT_IMPLEMENTS_QUERY_MODIFIERS
 #define BUFFER_IMPLEMENTS_FLUSH
 #define BUFFER_IMPLEMENTS_DAMAGE
+#define BUFFER_IMPLEMENTS_UPLOAD
 #define RENDERER_IMPLEMENTS_REGION
+#define RENDERER_IMPLEMENTS_SET_CLIP
 #define RENDERER_IMPLEMENTS_BLEND
 #define RENDERER_IMPLEMENTS_BLEND_SCALED
 #define RENDERER_IMPLEMENTS_READ_PIXELS
@@ -243,12 +284,17 @@ IMPL(gbm_buffer, wld_buffer)
 static const char vertex_solid_src[] =
     "uniform mat4 proj;\n"
     "attribute vec2 pos;\n"
-    "void main() { gl_Position = proj * vec4(pos, 0.0, 1.0); }\n";
+    "attribute vec4 color;\n"
+    "varying vec4 v_color;\n"
+    "void main() {\n"
+    "  v_color = color;\n"
+    "  gl_Position = proj * vec4(pos, 0.0, 1.0);\n"
+    "}\n";
 
 static const char fragment_solid_src[] =
     "precision mediump float;\n"
-    "uniform vec4 color;\n"
-    "void main() { gl_FragColor = color; }\n";
+    "varying vec4 v_color;\n"
+    "void main() { gl_FragColor = v_color; }\n";
 
 static const char vertex_tex_src[] =
     "uniform mat4 proj;\n"
@@ -269,12 +315,25 @@ static const char fragment_tex_src[] =
     "uniform vec4 add;\n"
     "void main() { gl_FragColor = texture2D(tex, v_tex) * mul + add; }\n";
 
+static const char vertex_glyph_src[] =
+    "uniform mat4 proj;\n"
+    "attribute vec2 pos;\n"
+    "attribute vec2 texcoord;\n"
+    "attribute vec4 color;\n"
+    "varying vec2 v_tex;\n"
+    "varying vec4 v_color;\n"
+    "void main() {\n"
+    "  v_tex = texcoord;\n"
+    "  v_color = color;\n"
+    "  gl_Position = proj * vec4(pos, 0.0, 1.0);\n"
+    "}\n";
+
 static const char fragment_glyph_src[] =
     "precision mediump float;\n"
     "varying vec2 v_tex;\n"
+    "varying vec4 v_color;\n"
     "uniform sampler2D tex;\n"
-    "uniform vec4 color;\n"
-    "void main() { gl_FragColor = color * texture2D(tex, v_tex).a; }\n";
+    "void main() { gl_FragColor = v_color * texture2D(tex, v_tex).a; }\n";
 
 static GLuint
 compile_shader(GLenum type, const char *source)
@@ -321,6 +380,7 @@ link_program(const char *vertex_source, const char *fragment_source)
 	 * slots; a name a shader does not use is simply ignored. */
 	glBindAttribLocation(program, ATTRIB_POS, "pos");
 	glBindAttribLocation(program, ATTRIB_TEXCOORD, "texcoord");
+	glBindAttribLocation(program, ATTRIB_COLOR, "color");
 	glLinkProgram(program);
 	glDeleteShader(vertex);
 	glDeleteShader(fragment);
@@ -565,12 +625,18 @@ driver_create_context(int drm_fd)
 	glVertexAttribPointer(ATTRIB_TEXCOORD, 2, GL_FLOAT, GL_FALSE,
 	                      VERTEX_FLOATS * sizeof(GLfloat),
 	                      (void *)(2 * sizeof(GLfloat)));
+	glVertexAttribPointer(ATTRIB_COLOR, 4, GL_FLOAT, GL_FALSE,
+	                      VERTEX_FLOATS * sizeof(GLfloat),
+	                      (void *)(4 * sizeof(GLfloat)));
 	glEnableVertexAttribArray(ATTRIB_POS);
 	glEnableVertexAttribArray(ATTRIB_TEXCOORD);
+	glEnableVertexAttribArray(ATTRIB_COLOR);
 	glActiveTexture(GL_TEXTURE0);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	glDisable(GL_BLEND);
 	context->gl.blend = 0;
+	context->gl.scissor = -1;
+	context->fence_fd = -1;
 
 	context_initialize(&context->base, &wld_context_impl);
 	DEBUG("using GBM/EGL context (EGL %d.%d)\n", major, minor);
@@ -611,15 +677,6 @@ bind_texture(struct gbm_context *context, GLuint texture)
 	}
 }
 
-/* Deleting a bound texture unbinds it, and its name can be handed out again. */
-static void
-delete_texture(struct gbm_context *context, GLuint texture)
-{
-	glDeleteTextures(1, &texture);
-	if (context->gl.texture == texture)
-		context->gl.texture = 0;
-}
-
 static void
 set_blend(struct gbm_context *context, bool blend)
 {
@@ -629,6 +686,140 @@ set_blend(struct gbm_context *context, bool blend)
 		else
 			glDisable(GL_BLEND);
 		context->gl.blend = blend;
+	}
+}
+
+/**** Batching ****/
+
+/*
+ * Room for `quads` quads in the staging array. Returns NULL, having drawn
+ * nothing, if that much memory cannot be had.
+ */
+static GLfloat *
+reserve_quads(struct gbm_context *context, size_t quads)
+{
+	GLfloat *verts;
+	size_t capacity;
+
+	if (quads <= context->verts_capacity)
+		return context->verts;
+
+	capacity = context->verts_capacity ? context->verts_capacity : 64;
+	while (capacity < quads) {
+		if (capacity > SIZE_MAX / 2 / (QUAD_FLOATS * sizeof(GLfloat)))
+			return NULL;
+		capacity *= 2;
+	}
+
+	if (!(verts = realloc(context->verts,
+	                      capacity * QUAD_FLOATS * sizeof(GLfloat))))
+		return NULL;
+
+	context->verts = verts;
+	context->verts_capacity = capacity;
+	return verts;
+}
+
+static GLfloat *
+put_quad(GLfloat *v, GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2,
+         GLfloat s1, GLfloat t1, GLfloat s2, GLfloat t2, const GLfloat rgba[4])
+{
+	const GLfloat r = rgba[0], g = rgba[1], b = rgba[2], a = rgba[3];
+	const GLfloat quad[QUAD_FLOATS] = {
+		x1, y1, s1, t1, r, g, b, a,
+		x2, y1, s2, t1, r, g, b, a,
+		x1, y2, s1, t2, r, g, b, a,
+		x2, y1, s2, t1, r, g, b, a,
+		x2, y2, s2, t2, r, g, b, a,
+		x1, y2, s1, t2, r, g, b, a,
+	};
+
+	memcpy(v, quad, sizeof quad);
+	return v + QUAD_FLOATS;
+}
+
+/* Draw whatever is staged, with the state it was staged under. */
+static void
+batch_flush(struct gbm_context *context)
+{
+	if (!context->batch.quads)
+		return;
+
+	glBufferData(GL_ARRAY_BUFFER,
+	             context->batch.quads * QUAD_FLOATS * sizeof(GLfloat),
+	             context->verts, GL_STREAM_DRAW);
+	glDrawArrays(GL_TRIANGLES, 0, context->batch.quads * 6);
+	context->batch.quads = 0;
+	++context->submissions;
+}
+
+/*
+ * Put the state the next quads need in place. Quads staged under anything
+ * else are drawn first; under the same state they simply wait for company.
+ */
+static void
+batch_begin(struct gles_renderer *renderer, GLuint program, GLuint texture,
+            bool blend)
+{
+	struct gbm_context *context = renderer->context;
+
+	if (context->batch.quads
+	    && (context->batch.renderer != renderer
+	        || context->batch.program != program
+	        || context->batch.texture != texture
+	        || context->batch.blend != blend))
+		batch_flush(context);
+
+	use_program(context, program);
+	bind_texture(context, texture);
+	set_blend(context, blend);
+	context->batch.renderer = renderer;
+	context->batch.program = program;
+	context->batch.texture = texture;
+	context->batch.blend = blend;
+}
+
+/* Where to write `quads` more quads for the current batch, or NULL. */
+static GLfloat *
+batch_reserve(struct gbm_context *context, size_t quads)
+{
+	GLfloat *v = reserve_quads(context, context->batch.quads + quads);
+
+	if (!v)
+		return NULL;
+	v += context->batch.quads * QUAD_FLOATS;
+	context->batch.quads += quads;
+	return v;
+}
+
+/*
+ * Bind a texture in order to change it. Quads staged against it, or against
+ * anything else, are drawn first: the binding is part of their state, and
+ * GL only orders a texture update after draws already issued.
+ */
+static void
+bind_texture_for_upload(struct gbm_context *context, GLuint texture)
+{
+	batch_flush(context);
+	bind_texture(context, texture);
+}
+
+/* Deleting a bound texture unbinds it, and its name can be handed out again. */
+static void
+delete_texture(struct gbm_context *context, GLuint texture)
+{
+	struct gles_renderer *renderer;
+
+	if (context->batch.quads && context->batch.texture == texture)
+		batch_flush(context);
+	glDeleteTextures(1, &texture);
+	if (context->gl.texture == texture)
+		context->gl.texture = 0;
+	/* The name may come back for another buffer, which must not then pass
+	 * for the target that is already attached. */
+	for (renderer = context->renderers; renderer; renderer = renderer->next) {
+		if (renderer->target_texture == texture)
+			renderer->target_texture = 0;
 	}
 }
 
@@ -658,6 +849,11 @@ export(struct wld_exporter *exporter, struct wld_buffer *base,
 		                  : DRM_FORMAT_MOD_LINEAR;
 		return true;
 	case WLD_DRM_OBJECT_PRIME_FD:
+		/* Whoever gets the descriptor has no fence to go by. */
+		if (buffer->context->unfinished) {
+			glFinish();
+			buffer->context->unfinished = false;
+		}
 		if (buffer->bo) {
 			object->i = gbm_bo_get_fd(buffer->bo);
 			return object->i >= 0;
@@ -760,7 +956,7 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 	 * drawing source we upload it into a normal GL texture, the same way a
 	 * compositor handles a client's shm buffer.
 	 */
-	if (flags & WLD_FLAG_MAP) {
+	if (flags & (WLD_FLAG_MAP | WLD_FLAG_UPLOAD)) {
 		struct gbm_buffer *cpu_buffer;
 		uint32_t bytes_per_pixel = format_bytes_per_pixel(format);
 		if (!width || !height || !bytes_per_pixel ||
@@ -822,6 +1018,22 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 			drmIoctl(context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
 		}
 			return NULL;
+		}
+
+		/*
+		 * A texture and nothing else: the pixels come straight from the
+		 * caller's memory through wld_buffer_upload(), so there is no copy
+		 * of them to keep here, and none to make on the way in.
+		 */
+		if (flags & WLD_FLAG_UPLOAD) {
+			buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, false,
+			                    width, height, format, pitch);
+			if (!buffer)
+				return NULL;
+			cpu_buffer = gbm_buffer(&buffer->base);
+			cpu_buffer->cpu = true;
+			cpu_buffer->upload_only = true;
+			return buffer;
 		}
 
 		bool mapped = size >= PIXEL_MAPPING_THRESHOLD;
@@ -1000,6 +1212,8 @@ context_destroy(struct wld_context *base)
 	free(context->atlas.slots);
 	glDeleteBuffers(1, &context->vbo);
 	free(context->verts);
+	if (context->fence_fd >= 0)
+		close(context->fence_fd);
 
 	eglMakeCurrent(context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
 	               EGL_NO_CONTEXT);
@@ -1078,7 +1292,7 @@ buffer_damage(struct buffer *base, pixman_region32_t *region)
 {
 	struct gbm_buffer *buffer = gbm_buffer(&base->base);
 
-	if (!buffer->cpu)
+	if (!buffer->cpu || buffer->upload_only)
 		return;
 
 	buffer->damage_reported = true;
@@ -1104,7 +1318,7 @@ buffer_flush(struct buffer *base)
 	 * for a CPU buffer means the CPU has just finished drawing into it. Unless
 	 * that renderer said where, it could have been anywhere.
 	 */
-	if (buffer->cpu) {
+	if (buffer->cpu && !buffer->upload_only) {
 		if (!buffer->damage_reported)
 			buffer->dirty = true;
 		buffer->damage_reported = false;
@@ -1156,19 +1370,18 @@ buffer_destroy(struct buffer *base)
 /**** Renderer ****/
 
 /*
- * Copy one box of a CPU buffer's pixels into its texture, which is bound.
+ * Copy one box of pixels into the bound texture.
  *
  * GLES2 has no GL_UNPACK_ROW_LENGTH, so without GL_EXT_unpack_subimage the
  * rows of a box narrower than the pitch cannot be uploaded in one call.
  */
 static void
-upload_box(struct gbm_buffer *buffer, const pixman_box32_t *box)
+upload_box(struct gbm_context *context, const uint8_t *pixels, uint32_t pitch,
+           uint32_t buffer_width, const pixman_box32_t *box)
 {
-	uint32_t pitch = buffer->base.base.pitch;
 	uint32_t row_pixels = pitch / 4;
 	int32_t x = box->x1, y = box->y1;
 	int32_t width = box->x2 - box->x1, height = box->y2 - box->y1;
-	const uint8_t *pixels = buffer->base.base.map;
 
 	if (width <= 0 || height <= 0)
 		return;
@@ -1176,13 +1389,13 @@ upload_box(struct gbm_buffer *buffer, const pixman_box32_t *box)
 	if (row_pixels == (uint32_t)width) {
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
 		                GL_UNSIGNED_BYTE, pixels + (size_t)y * pitch);
-	} else if (buffer->context->has_unpack_subimage) {
+	} else if (context->has_unpack_subimage) {
 		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, row_pixels);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_BGRA_EXT,
 		                GL_UNSIGNED_BYTE,
 		                pixels + (size_t)y * pitch + (size_t)x * 4);
 		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
-	} else if (row_pixels == buffer->base.base.width) {
+	} else if (row_pixels == buffer_width) {
 		/* Whole rows are contiguous, so widen the box to them. */
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, row_pixels, height,
 		                GL_BGRA_EXT, GL_UNSIGNED_BYTE,
@@ -1199,10 +1412,52 @@ upload_box(struct gbm_buffer *buffer, const pixman_box32_t *box)
 	}
 }
 
+/* Upload every box of a region, or the box around them all past a point. */
+static void
+upload_region(struct gbm_context *context, const uint8_t *pixels,
+              uint32_t pitch, uint32_t buffer_width, pixman_region32_t *region)
+{
+	pixman_box32_t *boxes;
+	int count;
+
+	boxes = pixman_region32_rectangles(region, &count);
+	/*
+	 * A region fragmented into many small boxes costs more in calls than the
+	 * few extra bytes its bounding box would upload.
+	 */
+	if (count > DIRTY_BOX_LIMIT) {
+		boxes = pixman_region32_extents(region);
+		count = 1;
+	}
+	while (count--)
+		upload_box(context, pixels, pitch, buffer_width, boxes++);
+	++context->submissions;
+}
+
+/* Give a CPU buffer's texture its storage, blank, the first time. */
+static void
+allocate_texture_storage(struct gbm_buffer *buffer)
+{
+	uint32_t width = buffer->base.base.width;
+	uint32_t height = buffer->base.base.height;
+	void *zero;
+
+	if (buffer->tex_allocated)
+		return;
+	/* Blank rather than undefined: the edges of what is uploaded later are
+	 * filtered against their neighbours. */
+	zero = calloc((size_t)width * 4, height);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, width, height, 0, GL_BGRA_EXT,
+	             GL_UNSIGNED_BYTE, zero);
+	free(zero);
+	buffer->tex_allocated = true;
+}
+
 /* Lazily wrap a buffer's EGLImage in a GL texture. */
 static GLuint
 buffer_texture(struct gbm_buffer *buffer)
 {
+	struct gbm_context *context = buffer->context;
 	bool fresh = buffer->texture == 0;
 
 	if (fresh) {
@@ -1210,57 +1465,53 @@ buffer_texture(struct gbm_buffer *buffer)
 			return 0;
 
 		glGenTextures(1, &buffer->texture);
-		bind_texture(buffer->context, buffer->texture);
+		bind_texture_for_upload(context, buffer->texture);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 		if (!buffer->cpu) {
-			buffer->context->image_target_texture_2d(GL_TEXTURE_2D,
-			                                         buffer->image);
+			context->image_target_texture_2d(GL_TEXTURE_2D, buffer->image);
 			return buffer->texture;
 		}
+	}
+
+	/* Nothing to bring across: the pixels only ever arrive by upload. */
+	if (buffer->upload_only) {
+		if (!buffer->tex_allocated) {
+			bind_texture_for_upload(context, buffer->texture);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+			allocate_texture_storage(buffer);
+		}
+		return buffer->texture;
 	}
 
 	/* CPU-backed contents live in system memory and must be uploaded. */
 	if (buffer->cpu && (fresh || buffer->dirty
 	                    || pixman_region32_not_empty(&buffer->dirty_region))) {
-		uint32_t width = buffer->base.base.width;
-		uint32_t height = buffer->base.base.height;
-		pixman_box32_t full = { 0, 0, width, height }, *boxes;
-		int count;
-
 		if (!buffer->base.base.map)
 			return 0;
 
-		bind_texture(buffer->context, buffer->texture);
+		bind_texture_for_upload(context, buffer->texture);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
 		/* Allocate storage once; refreshes are sub-image updates. */
-		if (!buffer->tex_allocated) {
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, width, height, 0,
-			             GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
-			buffer->tex_allocated = true;
-		}
+		allocate_texture_storage(buffer);
 
 		if (fresh || buffer->dirty) {
-			boxes = &full;
-			count = 1;
-		} else {
-			boxes = pixman_region32_rectangles(&buffer->dirty_region, &count);
-			/*
-			 * A region fragmented into many small boxes costs more in calls
-			 * than the few extra bytes its bounding box would upload.
-			 */
-			if (count > DIRTY_BOX_LIMIT) {
-				boxes = pixman_region32_extents(&buffer->dirty_region);
-				count = 1;
-			}
-		}
+			pixman_region32_t full;
 
-		while (count--) {
-			upload_box(buffer, boxes++);
+			pixman_region32_init_rect(&full, 0, 0, buffer->base.base.width,
+			                          buffer->base.base.height);
+			upload_region(context, buffer->base.base.map,
+			              buffer->base.base.pitch, buffer->base.base.width,
+			              &full);
+			pixman_region32_fini(&full);
+		} else {
+			upload_region(context, buffer->base.base.map,
+			              buffer->base.base.pitch, buffer->base.base.width,
+			              &buffer->dirty_region);
 		}
 
 		buffer->dirty = false;
@@ -1268,6 +1519,43 @@ buffer_texture(struct gbm_buffer *buffer)
 	}
 
 	return buffer->texture;
+}
+
+/*
+ * Copy a region of the caller's pixels into the texture, straight from where
+ * they are. This is how a client's shared memory reaches the GPU: one copy,
+ * by the driver, rather than a copy into a buffer of ours and another out
+ * of it.
+ */
+bool
+buffer_upload(struct buffer *base, const void *pixels, uint32_t pitch,
+              pixman_region32_t *region)
+{
+	struct gbm_buffer *buffer = gbm_buffer(&base->base);
+	struct gbm_context *context = buffer->context;
+	pixman_region32_t clipped;
+
+	/* Rows have to start on a 4-byte boundary for the unpack alignment,
+	 * and only 32-bit formats are uploaded here. */
+	if (!buffer->cpu || !pixels || pitch % 4 || pitch < 4)
+		return false;
+	if (!buffer_texture(buffer))
+		return false;
+
+	/* The caller's rows may be narrower than the buffer, which is padded
+	 * out past what a client hands over; only what both hold is copied. */
+	pixman_region32_init(&clipped);
+	pixman_region32_intersect_rect(&clipped, region, 0, 0,
+	                               base->base.width < pitch / 4 ? base->base.width : pitch / 4,
+	                               base->base.height);
+	if (pixman_region32_not_empty(&clipped)) {
+		bind_texture_for_upload(context, buffer->texture);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		allocate_texture_storage(buffer);
+		upload_region(context, pixels, pitch, base->base.width, &clipped);
+	}
+	pixman_region32_fini(&clipped);
+	return true;
 }
 
 /*
@@ -1294,8 +1582,10 @@ set_projection(struct gles_renderer *renderer, uint32_t width, uint32_t height)
 }
 
 /*
- * Make this renderer's framebuffer the one drawn to. Renderers share the GL
- * context, so another one may have bound its own since our target was set.
+ * Make this renderer's framebuffer the one drawn to, and its clip the
+ * scissor. Renderers share the GL context, so another one may have bound its
+ * own since our target was set. Either change draws the staged quads first,
+ * since they were staged for the state being replaced.
  */
 static bool
 bind_target(struct gles_renderer *renderer)
@@ -1306,9 +1596,27 @@ bind_target(struct gles_renderer *renderer)
 		return false;
 
 	if (context->gl.fbo != renderer->fbo) {
+		batch_flush(context);
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->fbo);
 		glViewport(0, 0, renderer->target_width, renderer->target_height);
 		context->gl.fbo = renderer->fbo;
+	}
+
+	if (context->gl.scissor != (int)renderer->clip_enabled
+	    || (renderer->clip_enabled
+	        && memcmp(&context->gl.scissor_box, &renderer->clip,
+	                  sizeof renderer->clip) != 0)) {
+		batch_flush(context);
+		if (renderer->clip_enabled) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(renderer->clip.x1, renderer->clip.y1,
+			          renderer->clip.x2 - renderer->clip.x1,
+			          renderer->clip.y2 - renderer->clip.y1);
+			context->gl.scissor_box = renderer->clip;
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+		context->gl.scissor = renderer->clip_enabled;
 	}
 
 	return true;
@@ -1321,77 +1629,6 @@ load_projection(struct gles_renderer *renderer, GLint location, bool *valid)
 		glUniformMatrix4fv(location, 1, GL_FALSE, renderer->proj);
 		*valid = true;
 	}
-}
-
-static void
-load_color(GLint location, const GLfloat rgba[4], GLfloat cached[4],
-           bool *valid)
-{
-	if (!*valid || memcmp(cached, rgba, 4 * sizeof(GLfloat)) != 0) {
-		glUniform4fv(location, 1, rgba);
-		memcpy(cached, rgba, 4 * sizeof(GLfloat));
-		*valid = true;
-	}
-}
-
-/**** Batching ****/
-
-/*
- * Room for `quads` quads in the staging array. Returns NULL, having drawn
- * nothing, if that much memory cannot be had.
- */
-static GLfloat *
-reserve_quads(struct gbm_context *context, size_t quads)
-{
-	GLfloat *verts;
-	size_t capacity;
-
-	if (quads <= context->verts_capacity)
-		return context->verts;
-
-	capacity = context->verts_capacity ? context->verts_capacity : 64;
-	while (capacity < quads) {
-		if (capacity > SIZE_MAX / 2 / (QUAD_FLOATS * sizeof(GLfloat)))
-			return NULL;
-		capacity *= 2;
-	}
-
-	if (!(verts = realloc(context->verts,
-	                      capacity * QUAD_FLOATS * sizeof(GLfloat))))
-		return NULL;
-
-	context->verts = verts;
-	context->verts_capacity = capacity;
-	return verts;
-}
-
-static GLfloat *
-put_quad(GLfloat *v, GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2,
-         GLfloat s1, GLfloat t1, GLfloat s2, GLfloat t2)
-{
-	const GLfloat quad[QUAD_FLOATS] = {
-		x1, y1, s1, t1,
-		x2, y1, s2, t1,
-		x1, y2, s1, t2,
-		x2, y1, s2, t1,
-		x2, y2, s2, t2,
-		x1, y2, s1, t2,
-	};
-
-	memcpy(v, quad, sizeof quad);
-	return v + QUAD_FLOATS;
-}
-
-/* Draw the first `quads` staged quads with whatever state is bound. */
-static void
-draw_quads(struct gbm_context *context, size_t quads)
-{
-	if (!quads)
-		return;
-
-	glBufferData(GL_ARRAY_BUFFER, quads * QUAD_FLOATS * sizeof(GLfloat),
-	             context->verts, GL_STREAM_DRAW);
-	glDrawArrays(GL_TRIANGLES, 0, quads * 6);
 }
 
 /*
@@ -1413,12 +1650,17 @@ setup_textured(struct gles_renderer *renderer, struct buffer *src_base,
 	if (!(texture = buffer_texture(src)))
 		return false;
 
-	use_program(context, renderer->textured.program);
+	/* An XRGB source carries no meaningful alpha, so force it opaque. The
+	 * uniform applies to whatever is staged too, so that is drawn first. */
+	opaque = src_base->base.format == WLD_FORMAT_XRGB8888;
+	if (renderer->textured.opaque != opaque)
+		batch_flush(context);
+
+	/* wld buffers hold premultiplied alpha. */
+	batch_begin(renderer, renderer->textured.program, texture, blend);
 	load_projection(renderer, renderer->textured.proj,
 	                &renderer->textured.proj_valid);
 
-	/* An XRGB source carries no meaningful alpha, so force it opaque. */
-	opaque = src_base->base.format == WLD_FORMAT_XRGB8888;
 	if (renderer->textured.opaque != opaque) {
 		GLfloat mul[4] = { 1.0f, 1.0f, 1.0f, opaque ? 0.0f : 1.0f };
 		GLfloat add[4] = { 0.0f, 0.0f, 0.0f, opaque ? 1.0f : 0.0f };
@@ -1428,27 +1670,21 @@ setup_textured(struct gles_renderer *renderer, struct buffer *src_base,
 		renderer->textured.opaque = opaque;
 	}
 
-	bind_texture(context, texture);
-	/* wld buffers hold premultiplied alpha. */
-	set_blend(context, blend);
-
 	return true;
 }
 
+/* Solid fills sample nothing, so whatever texture is bound stays bound. */
 static void
-setup_solid(struct gles_renderer *renderer, uint32_t color)
+setup_solid(struct gles_renderer *renderer)
 {
 	struct gbm_context *context = renderer->context;
-	GLfloat rgba[4];
 
-	color_to_gl(color, rgba);
-	use_program(context, renderer->solid.program);
+	batch_begin(renderer, renderer->solid.program, context->gl.texture, false);
 	load_projection(renderer, renderer->solid.proj,
 	                &renderer->solid.proj_valid);
-	load_color(renderer->solid.color, rgba, renderer->solid.color_value,
-	           &renderer->solid.color_valid);
-	set_blend(context, false);
 }
+
+static const GLfloat white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
 static void
 composite_region(struct wld_renderer *base, struct buffer *src_base,
@@ -1467,18 +1703,15 @@ composite_region(struct wld_renderer *base, struct buffer *src_base,
 		return;
 	if (!setup_textured(renderer, src_base, blend))
 		return;
-	if (!(v = reserve_quads(renderer->context, count)))
+	if (!(v = batch_reserve(renderer->context, count)))
 		return;
 
-	/* Every box shares the program, texture and blend, so one draw does. */
 	for (i = 0; i < count; ++i) {
 		v = put_quad(v, boxes[i].x1 + dst_x, boxes[i].y1 + dst_y,
 		             boxes[i].x2 + dst_x, boxes[i].y2 + dst_y,
 		             boxes[i].x1 / src_w, boxes[i].y1 / src_h,
-		             boxes[i].x2 / src_w, boxes[i].y2 / src_h);
+		             boxes[i].x2 / src_w, boxes[i].y2 / src_h, white);
 	}
-
-	draw_quads(renderer->context, count);
 }
 
 uint32_t
@@ -1503,7 +1736,9 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	GLuint texture;
 
 	if (!buffer) {
+		batch_flush(context);
 		renderer->target_texture = 0;
+		renderer->clip_enabled = false;
 		return true;
 	}
 
@@ -1513,19 +1748,33 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	if (!(texture = buffer_texture(gbm_buffer(&buffer->base))))
 		return false;
 
-	glBindFramebuffer(GL_FRAMEBUFFER, renderer->fbo);
-	context->gl.fbo = renderer->fbo;
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-	                       texture, 0);
+	/* The staged quads were for the target being replaced. */
+	batch_flush(context);
+	renderer->clip_enabled = false;
 
-	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-		DEBUG("framebuffer incomplete for target buffer\n");
-		renderer->target_texture = 0;
-		return false;
+	/*
+	 * Already attached and bound: nothing to do but the bookkeeping below.
+	 * Attaching again would also mean asking the driver to validate the
+	 * framebuffer again, which is not free on every driver.
+	 */
+	if (renderer->target_texture != texture || context->gl.fbo != renderer->fbo) {
+		glBindFramebuffer(GL_FRAMEBUFFER, renderer->fbo);
+		context->gl.fbo = renderer->fbo;
+		if (renderer->target_texture != texture) {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			                       GL_TEXTURE_2D, texture, 0);
+
+			if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+			    != GL_FRAMEBUFFER_COMPLETE) {
+				DEBUG("framebuffer incomplete for target buffer\n");
+				renderer->target_texture = 0;
+				return false;
+			}
+		}
+		glViewport(0, 0, buffer->base.width, buffer->base.height);
 	}
 
 	renderer->target_texture = texture;
-	glViewport(0, 0, buffer->base.width, buffer->base.height);
 	if (renderer->target_width != buffer->base.width
 	    || renderer->target_height != buffer->base.height
 	    || !renderer->proj[15]) {
@@ -1542,16 +1791,17 @@ renderer_fill_rectangle(struct wld_renderer *base, uint32_t color, int32_t x,
                         int32_t y, uint32_t width, uint32_t height)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
-	GLfloat *v;
+	GLfloat rgba[4], *v;
 
 	if (!bind_target(renderer))
 		return;
-	if (!(v = reserve_quads(renderer->context, 1)))
+	setup_solid(renderer);
+	if (!(v = batch_reserve(renderer->context, 1)))
 		return;
 
-	setup_solid(renderer, color);
-	put_quad(v, x, y, x + (int32_t)width, y + (int32_t)height, 0, 0, 0, 0);
-	draw_quads(renderer->context, 1);
+	color_to_gl(color, rgba);
+	put_quad(v, x, y, x + (int32_t)width, y + (int32_t)height, 0, 0, 0, 0,
+	         rgba);
 }
 
 void
@@ -1560,21 +1810,21 @@ renderer_fill_region(struct wld_renderer *base, uint32_t color,
 {
 	struct gles_renderer *renderer = gles_renderer(base);
 	pixman_box32_t *boxes;
-	GLfloat *v;
+	GLfloat rgba[4], *v;
 	int count, i;
 
 	boxes = pixman_region32_rectangles(region, &count);
 	if (count <= 0 || !bind_target(renderer))
 		return;
-	if (!(v = reserve_quads(renderer->context, count)))
+	setup_solid(renderer);
+	if (!(v = batch_reserve(renderer->context, count)))
 		return;
 
-	setup_solid(renderer, color);
+	color_to_gl(color, rgba);
 	for (i = 0; i < count; ++i) {
 		v = put_quad(v, boxes[i].x1, boxes[i].y1, boxes[i].x2, boxes[i].y2,
-		             0, 0, 0, 0);
+		             0, 0, 0, 0, rgba);
 	}
-	draw_quads(renderer->context, count);
 }
 
 void
@@ -1616,7 +1866,7 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *src_base,
 		return;
 	if (!setup_textured(renderer, src_base, true))
 		return;
-	if (!(v = reserve_quads(renderer->context, 1)))
+	if (!(v = batch_reserve(renderer->context, 1)))
 		return;
 
 	/*
@@ -1633,8 +1883,7 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *src_base,
 	         dst->y + (int32_t)dst->height,
 	         (GLfloat)(src->x / src_w), (GLfloat)(src->y / src_h),
 	         (GLfloat)((src->x + src->width) / src_w),
-	         (GLfloat)((src->y + src->height) / src_h));
-	draw_quads(renderer->context, 1);
+	         (GLfloat)((src->y + src->height) / src_h), white);
 }
 
 /**** Glyph atlas ****/
@@ -1661,7 +1910,7 @@ atlas_create(struct gbm_context *context)
 	}
 
 	glGenTextures(1, &atlas->texture);
-	bind_texture(context, atlas->texture);
+	bind_texture_for_upload(context, atlas->texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1767,11 +2016,12 @@ atlas_glyph(struct gbm_context *context, struct glyph *glyph,
 	if (!(pixels = glyph_alpha(bitmap)))
 		return GLYPH_SKIP;
 
-	bind_texture(context, atlas->texture);
+	bind_texture_for_upload(context, atlas->texture);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexSubImage2D(GL_TEXTURE_2D, 0, atlas->shelf_x, atlas->shelf_y, width,
 	                height, GL_ALPHA, GL_UNSIGNED_BYTE, pixels);
 	free(pixels);
+	++context->submissions;
 
 	slot = &atlas->slots[index];
 	slot->serial = glyph->serial;
@@ -1802,7 +2052,6 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 	FT_UInt glyph_index;
 	GLfloat rgba[4], scale;
 	uint32_t origin_x = 0, c;
-	size_t quads = 0;
 	GLfloat *v;
 	int ret;
 
@@ -1827,13 +2076,6 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 	scale = 1.0f / (GLfloat)context->atlas.size;
 
 	color_to_gl(color, rgba);
-	use_program(context, renderer->glyph.program);
-	load_projection(renderer, renderer->glyph.proj,
-	                &renderer->glyph.proj_valid);
-	load_color(renderer->glyph.color, rgba, renderer->glyph.color_value,
-	           &renderer->glyph.color_valid);
-	bind_texture(context, context->atlas.texture);
-	set_blend(context, true);
 
 	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0 && c != '\0') {
 		text += ret;
@@ -1844,30 +2086,33 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 			continue;
 
 		glyph = font->glyphs[glyph_index];
+		/* A missing glyph is uploaded, which draws what is staged first:
+		 * anything pointing into the atlas has to go before it is reused. */
 		result = atlas_glyph(context, glyph, &slot);
 		if (result == GLYPH_FULL) {
-			/* Draw what already points into the atlas before reusing it. */
-			draw_quads(context, quads);
-			quads = 0;
+			batch_flush(context);
 			atlas_reset(&context->atlas);
 			result = atlas_glyph(context, glyph, &slot);
 		}
 
-		if (result == GLYPH_OK && (v = reserve_quads(context, quads + 1))) {
+		if (result == GLYPH_OK) {
 			GLfloat gx = x + (int32_t)origin_x + glyph->x;
 			GLfloat gy = y + glyph->y;
 
-			put_quad(v + quads * QUAD_FLOATS, gx, gy, gx + slot->width,
-			         gy + slot->height, slot->x * scale, slot->y * scale,
-			         (slot->x + slot->width) * scale,
-			         (slot->y + slot->height) * scale);
-			++quads;
+			batch_begin(renderer, renderer->glyph.program,
+			            context->atlas.texture, true);
+			load_projection(renderer, renderer->glyph.proj,
+			                &renderer->glyph.proj_valid);
+			if ((v = batch_reserve(context, 1))) {
+				put_quad(v, gx, gy, gx + slot->width, gy + slot->height,
+				         slot->x * scale, slot->y * scale,
+				         (slot->x + slot->width) * scale,
+				         (slot->y + slot->height) * scale, rgba);
+			}
 		}
 
 		origin_x += glyph->advance;
 	}
-
-	draw_quads(context, quads);
 
 done:
 	if (extents)
@@ -1888,7 +2133,9 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
 	    (uint64_t)y + height > renderer->target_height)
 		return false;
 
-	/* Client-memory glReadPixels completes the read before returning. */
+	/* Client-memory glReadPixels completes the read before returning, and
+	 * it reads what has been drawn, so the batch has to be. */
+	batch_flush(renderer->context);
 
 	/*
 	 * GLES2 has no GL_PACK_ROW_LENGTH, so a destination with padding has to
@@ -2094,7 +2341,19 @@ renderer_export_fence(struct wld_renderer *base)
 	EGLSyncKHR sync;
 	int fd;
 
+	batch_flush(context);
 	if (context->has_native_fence) {
+		/*
+		 * Nothing has been queued since the last fence was made, so it still
+		 * says exactly when everything queued is done. Every buffer a client
+		 * replaces asks for one, and a frame's worth of them can share.
+		 */
+		if (context->fence_fd >= 0
+		    && context->fence_submissions == context->submissions) {
+			fd = fcntl(context->fence_fd, F_DUPFD_CLOEXEC, 0);
+			if (fd >= 0)
+				return fd;
+		}
 		sync = context->create_sync(context->display,
 		                            EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
 		if (sync != EGL_NO_SYNC_KHR) {
@@ -2102,8 +2361,16 @@ renderer_export_fence(struct wld_renderer *base)
 			glFlush();
 			fd = context->dup_native_fence_fd(context->display, sync);
 			context->destroy_sync(context->display, sync);
-			if (fd >= 0)
-				return fd;
+			if (fd >= 0) {
+				int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+
+				if (context->fence_fd >= 0)
+					close(context->fence_fd);
+				context->fence_fd = fd;
+				context->fence_submissions = context->submissions;
+				if (dup_fd >= 0)
+					return dup_fd;
+			}
 		}
 	}
 
@@ -2117,25 +2384,31 @@ renderer_flush(struct wld_renderer *base)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
 	struct gbm_context *context = renderer->context;
-	struct wld_buffer *target = base->target;
 
 	/*
-	 * A scanout buffer goes to KMS, and whatever hands it over waits on
-	 * wld_export_fence() first, so submitting the work is enough; waiting for
-	 * it here would stall the caller for a whole GPU frame. Anything else may
-	 * be read by the CPU or by another process with no fence to go by, so
-	 * flush() stays a real finish for those.
+	 * Submitting the work is enough. A scanout buffer goes to KMS, and
+	 * whatever hands it over waits on wld_export_fence() first; a buffer
+	 * drawn only to be drawn from again is ordered after this by the GPU
+	 * itself. Whatever is read by the CPU catches up where it is read:
+	 * mapping a buffer or exporting it finishes first, and reading pixels
+	 * back waits on its own. Finishing here would instead stall the caller
+	 * for every frame's worth of work so far -- in the middle of a frame,
+	 * when it is a titlebar being repainted.
 	 */
-	if (context->has_native_fence && target
-	    && target->impl == &wld_buffer_impl
-	    && gbm_buffer(target)->scanout) {
-		glFlush();
-		context->unfinished = true;
-		return;
-	}
+	batch_flush(context);
+	glFlush();
+	context->unfinished = true;
+}
 
-	glFinish();
-	context->unfinished = false;
+void
+renderer_set_clip(struct wld_renderer *base, const pixman_box32_t *box)
+{
+	struct gles_renderer *renderer = gles_renderer(base);
+
+	/* Takes effect at the next draw, which draws the staged quads first. */
+	renderer->clip_enabled = box != NULL;
+	if (box)
+		renderer->clip = *box;
 }
 
 void
@@ -2143,6 +2416,18 @@ renderer_destroy(struct wld_renderer *base)
 {
 	struct gles_renderer *renderer = gles_renderer(base);
 	struct gbm_context *context = renderer->context;
+	struct gles_renderer **link;
+
+	if (context->batch.renderer == renderer) {
+		batch_flush(context);
+		context->batch.renderer = NULL;
+	}
+	for (link = &context->renderers; *link; link = &(*link)->next) {
+		if (*link == renderer) {
+			*link = renderer->next;
+			break;
+		}
+	}
 
 	/* A deleted name can come back from the next glCreateProgram or
 	 * glGenFramebuffers, so the cache must not keep claiming it is bound. */
@@ -2177,7 +2462,7 @@ context_create_renderer(struct wld_context *base)
 
 	renderer->solid.program = link_program(vertex_solid_src, fragment_solid_src);
 	renderer->textured.program = link_program(vertex_tex_src, fragment_tex_src);
-	renderer->glyph.program = link_program(vertex_tex_src, fragment_glyph_src);
+	renderer->glyph.program = link_program(vertex_glyph_src, fragment_glyph_src);
 
 	if (!renderer->solid.program || !renderer->textured.program
 	    || !renderer->glyph.program) {
@@ -2185,8 +2470,6 @@ context_create_renderer(struct wld_context *base)
 	}
 
 	renderer->solid.proj = glGetUniformLocation(renderer->solid.program, "proj");
-	renderer->solid.color =
-	    glGetUniformLocation(renderer->solid.program, "color");
 
 	renderer->textured.proj =
 	    glGetUniformLocation(renderer->textured.program, "proj");
@@ -2198,8 +2481,6 @@ context_create_renderer(struct wld_context *base)
 
 	renderer->glyph.proj =
 	    glGetUniformLocation(renderer->glyph.program, "proj");
-	renderer->glyph.color =
-	    glGetUniformLocation(renderer->glyph.program, "color");
 
 	/* Both texturing programs only ever sample unit 0. */
 	use_program(context, renderer->textured.program);
@@ -2210,6 +2491,8 @@ context_create_renderer(struct wld_context *base)
 	glGenFramebuffers(1, &renderer->fbo);
 
 	renderer_initialize(&renderer->base, &wld_renderer_impl);
+	renderer->next = context->renderers;
+	context->renderers = renderer;
 
 	return &renderer->base;
 
