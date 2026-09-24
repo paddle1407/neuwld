@@ -112,6 +112,14 @@ wld_set_target_buffer(struct wld_renderer *renderer, struct wld_buffer *buffer)
 }
 
 EXPORT
+void
+wld_set_clip(struct wld_renderer *renderer, const pixman_box32_t *box)
+{
+	if (renderer->impl->set_clip)
+		renderer->impl->set_clip(renderer, box);
+}
+
+EXPORT
 bool
 wld_set_target_surface(struct wld_renderer *renderer, struct wld_surface *surface)
 {

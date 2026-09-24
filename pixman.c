@@ -63,6 +63,7 @@ struct pixman_map {
 #include "interface/context.h"
 #define RENDERER_IMPLEMENTS_REGION
 #define RENDERER_IMPLEMENTS_BLEND_SCALED
+#define RENDERER_IMPLEMENTS_SET_CLIP
 #include "interface/buffer.h"
 #include "interface/renderer.h"
 IMPL(pixman_renderer, wld_renderer)
@@ -268,8 +269,12 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 {
 	struct pixman_renderer *renderer = pixman_renderer(base);
 
-	if (renderer->target)
+	if (renderer->target) {
+		/* The image is the buffer's own, so a clip left on it would
+		 * confine whoever draws into that buffer next. */
+		pixman_image_set_clip_region32(renderer->target, NULL);
 		pixman_image_unref(renderer->target);
+	}
 
 	pixman_region32_clear(&renderer->damage);
 	renderer->damage_all = false;
@@ -283,6 +288,25 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 
 	renderer->target = NULL;
 	return true;
+}
+
+void
+renderer_set_clip(struct wld_renderer *base, const pixman_box32_t *box)
+{
+	struct pixman_renderer *renderer = pixman_renderer(base);
+	pixman_region32_t region;
+
+	if (!renderer->target)
+		return;
+	if (!box) {
+		pixman_image_set_clip_region32(renderer->target, NULL);
+		return;
+	}
+	pixman_region32_init_rect(&region, box->x1, box->y1,
+	                          box->x2 > box->x1 ? box->x2 - box->x1 : 0,
+	                          box->y2 > box->y1 ? box->y2 - box->y1 : 0);
+	pixman_image_set_clip_region32(renderer->target, &region);
+	pixman_region32_fini(&region);
 }
 
 static void

@@ -103,6 +103,11 @@ struct wld_renderer_impl {
 	uint32_t (*capabilities)(struct wld_renderer *renderer,
 	                         struct buffer *buffer);
 	bool (*set_target)(struct wld_renderer *renderer, struct buffer *buffer);
+	/**
+	 * Optional. Confines drawing to a box of the target until the target
+	 * changes; NULL lifts it.
+	 */
+	void (*set_clip)(struct wld_renderer *renderer, const pixman_box32_t *box);
 	void (*fill_rectangle)(struct wld_renderer *renderer,
 	                       uint32_t color, int32_t x, int32_t y,
 	                       uint32_t width, uint32_t height);
@@ -185,6 +190,12 @@ struct wld_buffer_impl {
 	 * still assume the whole buffer changed.
 	 */
 	void (*damage)(struct buffer *buffer, pixman_region32_t *region);
+	/**
+	 * Optional. Copies a region of the caller's pixels into the buffer
+	 * without going through a mapping. See wld_buffer_upload().
+	 */
+	bool (*upload)(struct buffer *buffer, const void *pixels, uint32_t pitch,
+	               pixman_region32_t *region);
 	void (*destroy)(struct buffer *buffer);
 };
 

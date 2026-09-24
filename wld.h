@@ -49,6 +49,13 @@ enum wld_format {
 enum wld_flags {
 	WLD_FLAG_MAP = 1 << 16,
 	WLD_FLAG_CURSOR = 1 << 17,
+	/*
+	 * The pixels are supplied through wld_buffer_upload() and nothing else.
+	 * A backend that draws from a texture keeps no CPU copy of such a buffer
+	 * and refuses to map it; one that cannot upload ignores the flag, so
+	 * asking for WLD_FLAG_MAP as well keeps the buffer usable either way.
+	 */
+	WLD_FLAG_UPLOAD = 1 << 18,
 };
 
 bool wld_lookup_named_color(const char *name, uint32_t *color);
@@ -176,6 +183,14 @@ struct wld_buffer {
 bool wld_map(struct wld_buffer *buffer);
 bool wld_unmap(struct wld_buffer *buffer);
 
+/**
+ * Copy 'region' of the 32-bit pixels at 'pixels', laid out 'pitch' bytes per
+ * row in the buffer's own coordinates, into the buffer. False if the backend
+ * cannot take pixels this way, in which case nothing was copied.
+ */
+bool wld_buffer_upload(struct wld_buffer *buffer, const void *pixels,
+                       uint32_t pitch, pixman_region32_t *region);
+
 bool wld_export(struct wld_buffer *buffer,
                 uint32_t type, union wld_object *object);
 
@@ -246,6 +261,13 @@ bool wld_set_target_buffer(struct wld_renderer *renderer,
 
 bool wld_set_target_surface(struct wld_renderer *renderer,
                             struct wld_surface *surface);
+
+/**
+ * Confine drawing to 'box', in target coordinates, or lift the confinement
+ * with NULL. Lasts until the target changes. A backend that cannot clip
+ * ignores it.
+ */
+void wld_set_clip(struct wld_renderer *renderer, const pixman_box32_t *box);
 
 void wld_fill_rectangle(struct wld_renderer *renderer, uint32_t color,
                         int32_t x, int32_t y, uint32_t width, uint32_t height);
