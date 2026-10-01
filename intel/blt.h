@@ -60,95 +60,95 @@ enum blt_raster_operation {
 };
 
 /* BR00 : BLT Opcode & Control */
-#define BLT_BR00_CLIENT(x) ((x) << 29)            /* 31:29 */
-#define BLT_BR00_OP(x) ((x) << 22)                /* 28:22 */
-#define BLT_BR00_32BPP_MASK(x) ((x) << 20)        /* 21:20 */
+#define BLT_BR00_CLIENT(x) ((uint32_t)(x) << 29)            /* 31:29 */
+#define BLT_BR00_OP(x) ((uint32_t)(x) << 22)                /* 28:22 */
+#define BLT_BR00_32BPP_MASK(x) ((uint32_t)(x) << 20)        /* 21:20 */
                                                   /* 19:17 */
-#define BLT_BR00_PACKING(x) ((x) << 16)           /* 16 */
-#define BLT_BR00_SRC_TILING_ENABLE(x) ((x) << 15) /* 15 */
+#define BLT_BR00_PACKING(x) ((uint32_t)(x) << 16)           /* 16 */
+#define BLT_BR00_SRC_TILING_ENABLE(x) ((uint32_t)(x) << 15) /* 15 */
                                                   /* 14:12 */
-#define BLT_BR00_DST_TILING_ENABLE(x) ((x) << 11) /* 11 */
-#define BLT_BR00_DWORD_LENGTH(x) ((x) << 0)       /* 7:0 */
+#define BLT_BR00_DST_TILING_ENABLE(x) ((uint32_t)(x) << 11) /* 11 */
+#define BLT_BR00_DWORD_LENGTH(x) ((uint32_t)(x) << 0)       /* 7:0 */
 
 /* BR01 : Setup BLT Raster OP, Control, and Destination Offset */
-#define BLT_BR01_SOLID_PATTERN(x) ((x) << 31)         /* 31 */
-#define BLT_BR01_CLIPPING_ENABLE(x) ((x) << 30)       /* 30 */
-#define BLT_BR01_MONO_SRC_TRANSPARENCY(x) ((x) << 29) /* 29 */
-#define BLT_BR01_MONO_PAT_TRANSPARENCY(x) ((x) << 28) /* 28 */
-#define BLT_BR01_COLOR_DEPTH(x) ((x) << 24)           /* 25:24 */
-#define BLT_BR01_RASTER_OPERATION(x) ((x) << 16)      /* 23:16 */
-#define BLT_BR01_DST_PITCH(x) ((x) << 0)              /* 15:0 */
+#define BLT_BR01_SOLID_PATTERN(x) ((uint32_t)(x) << 31)         /* 31 */
+#define BLT_BR01_CLIPPING_ENABLE(x) ((uint32_t)(x) << 30)       /* 30 */
+#define BLT_BR01_MONO_SRC_TRANSPARENCY(x) ((uint32_t)(x) << 29) /* 29 */
+#define BLT_BR01_MONO_PAT_TRANSPARENCY(x) ((uint32_t)(x) << 28) /* 28 */
+#define BLT_BR01_COLOR_DEPTH(x) ((uint32_t)(x) << 24)           /* 25:24 */
+#define BLT_BR01_RASTER_OPERATION(x) ((uint32_t)(x) << 16)      /* 23:16 */
+#define BLT_BR01_DST_PITCH(x) ((uint32_t)(x) << 0)              /* 15:0 */
 
 /* BR05 : Setup Expansion Background Color */
-#define BLT_BR05_BACKGROUND_COLOR(x) ((x) << 0) /* 31:0 */
+#define BLT_BR05_BACKGROUND_COLOR(x) ((uint32_t)(x) << 0) /* 31:0 */
 
 /* BR06 : Setup Expansion Foreground Color */
-#define BLT_BR06_FOREGROUND_COLOR(x) ((x) << 0) /* 31:0 */
+#define BLT_BR06_FOREGROUND_COLOR(x) ((uint32_t)(x) << 0) /* 31:0 */
 
 /* BR07 : Setup Blit Color Pattern Address Low Bits */
 /* 31:29 */
-#define BLT_BR07_PAT_ADDRESS(x) ((x) << 6) /* 28:6 */
+#define BLT_BR07_PAT_ADDRESS(x) ((uint32_t)(x) << 6) /* 28:6 */
                                            /* 5:0 */
 
 /* BR09 : Destination Address Low Bits */
 /* 31:29 */
-#define BLT_BR09_DST_ADDRESS(x) ((x) << 0) /* 28:0 */
+#define BLT_BR09_DST_ADDRESS(x) ((uint32_t)(x) << 0) /* 28:0 */
 
 /* BR11 : Source Pitch */
 /* 31:16 */
-#define BLT_BR11_SRC_PITCH(x) ((x) << 0) /* 15:0 */
+#define BLT_BR11_SRC_PITCH(x) ((uint32_t)(x) << 0) /* 15:0 */
 
 /* BR12 : Source Address Low Bits */
 /* 31:29 */
-#define BLT_BR12_SRC_ADDRESS(x) ((x) << 0) /* 28:0 */
+#define BLT_BR12_SRC_ADDRESS(x) ((uint32_t)(x) << 0) /* 28:0 */
 
 /* BR13 : BLT Raster OP, Control, and Destination Pitch */
-#define BLT_BR13_SOLID_PATTERN(x) ((x) << 31)        /* 31 */
-#define BLT_BR13_CLIPPING_ENABLE(x) ((x) << 30)      /* 30 */
-#define BLT_BR13_MONO_SRC_TRANSPARENT(x) ((x) << 29) /* 29 */
-#define BLT_BR13_MONO_PAT_TRANSPARENT(x) ((x) << 28) /* 28 */
-#define BLT_BR13_COLOR_DEPTH(x) ((x) << 24)          /* 25:24 */
-#define BLT_BR13_RASTER_OPERATION(x) ((x) << 16)     /* 23:16 */
-#define BLT_BR13_DST_PITCH(x) ((x) << 0)             /* 15:0 */
+#define BLT_BR13_SOLID_PATTERN(x) ((uint32_t)(x) << 31)        /* 31 */
+#define BLT_BR13_CLIPPING_ENABLE(x) ((uint32_t)(x) << 30)      /* 30 */
+#define BLT_BR13_MONO_SRC_TRANSPARENT(x) ((uint32_t)(x) << 29) /* 29 */
+#define BLT_BR13_MONO_PAT_TRANSPARENT(x) ((uint32_t)(x) << 28) /* 28 */
+#define BLT_BR13_COLOR_DEPTH(x) ((uint32_t)(x) << 24)          /* 25:24 */
+#define BLT_BR13_RASTER_OPERATION(x) ((uint32_t)(x) << 16)     /* 23:16 */
+#define BLT_BR13_DST_PITCH(x) ((uint32_t)(x) << 0)             /* 15:0 */
 
 /* BR16 : Pattern Expansion Background & Solid Pattern Color */
-#define BLT_BR16_COLOR(x) ((x) << 0) /* 31 : 0 */
+#define BLT_BR16_COLOR(x) ((uint32_t)(x) << 0) /* 31 : 0 */
 
 /* BR22 : Destination Top Left */
-#define BLT_BR22_DST_Y1(x) ((x) << 16) /* 31:16 */
-#define BLT_BR22_DST_X1(x) ((x) << 0)  /* 16:0 */
+#define BLT_BR22_DST_Y1(x) ((uint32_t)(x) << 16) /* 31:16 */
+#define BLT_BR22_DST_X1(x) ((uint32_t)(x) << 0)  /* 16:0 */
 
 /* BR23 : Destination Bottom Right */
-#define BLT_BR23_DST_Y2(x) ((x) << 16) /* 31:16 */
-#define BLT_BR23_DST_X2(x) ((x) << 0)  /* 16:0 */
+#define BLT_BR23_DST_Y2(x) ((uint32_t)(x) << 16) /* 31:16 */
+#define BLT_BR23_DST_X2(x) ((uint32_t)(x) << 0)  /* 16:0 */
 
 /* BR24 : Clip Rectangle Top Left */
 /* 31 */
-#define BLT_BR24_CLP_Y1(x) ((x) << 16) /* 30:16 */
+#define BLT_BR24_CLP_Y1(x) ((uint32_t)(x) << 16) /* 30:16 */
                                        /* 15 */
-#define BLT_BR24_CLP_X1(x) ((x) << 0)  /* 14:0 */
+#define BLT_BR24_CLP_X1(x) ((uint32_t)(x) << 0)  /* 14:0 */
 
 /* BR25 : Clip Rectangle Bottom Right */
 /* 31 */
-#define BLT_BR25_CLP_Y2(x) ((x) << 16) /* 30:16 */
+#define BLT_BR25_CLP_Y2(x) ((uint32_t)(x) << 16) /* 30:16 */
                                        /* 15 */
-#define BLT_BR25_CLP_X2(x) ((x) << 0)  /* 14:0 */
+#define BLT_BR25_CLP_X2(x) ((uint32_t)(x) << 0)  /* 14:0 */
 
 /* BR26 : Source Top Left */
-#define BLT_BR26_SRC_Y1(x) ((x) << 16) /* 31:16 */
-#define BLT_BR26_SRC_X1(x) ((x) << 0)  /* 15:0 */
+#define BLT_BR26_SRC_Y1(x) ((uint32_t)(x) << 16) /* 31:16 */
+#define BLT_BR26_SRC_X1(x) ((uint32_t)(x) << 0)  /* 15:0 */
 
 /* BR27 : Destination Address High Bits */
 /* 31:16 */
-#define BLT_BR27_DST_ADDRESS_HI(x) ((x) << 0) /* 15:0 */
+#define BLT_BR27_DST_ADDRESS_HI(x) ((uint32_t)(x) << 0) /* 15:0 */
 
 /* BR28 : Source Address High Bits */
 /* 31:16 */
-#define BLT_BR28_SRC_ADDRESS_HI(x) ((x) << 0) /* 15:0 */
+#define BLT_BR28_SRC_ADDRESS_HI(x) ((uint32_t)(x) << 0) /* 15:0 */
 
 /* BR30 : Setup Blit Color Pattern Address High Bits */
 /* 31:16 */
-#define BLT_BR30_PAT_ADDRESS_HI(x) ((x) << 0) /* 15:0 */
+#define BLT_BR30_PAT_ADDRESS_HI(x) ((uint32_t)(x) << 0) /* 15:0 */
 
 static inline void
 xy_setup_blt(struct intel_batch *batch,
@@ -246,7 +246,9 @@ xy_text_immediate_blt(struct intel_batch *batch,
                       uint16_t count, uint32_t *immediates)
 {
 	/* Round up to the next even number. */
-	uint8_t dwords = (count + 1) & ~1;
+	uint32_t dwords = ((uint32_t)count + 1) & ~1U;
+	if (dwords > 254)
+		return INTEL_BATCH_INVALID;
 	uint32_t index;
 	uint32_t tiling_mode, swizzle_mode;
 

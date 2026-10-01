@@ -815,14 +815,14 @@ bool
 wld_lookup_named_color(const char *name, uint32_t *color)
 {
 	char *end;
-	int low = 0, mid, high = ARRAY_LENGTH(named_colors);
+	int low = 0, mid, high = ARRAY_LENGTH(named_colors) - 1;
 	int r;
 
 	if (name[0] == '#' && name[1] != '\0') {
 		*color = strtoul(name + 1, &end, 16);
 
 		/* Set alpha channel to opaque. */
-		*color |= 0xff << 24;
+		*color |= UINT32_C(0xff000000);
 
 		if (*end == '\0')
 			return true;

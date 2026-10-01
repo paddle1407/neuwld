@@ -39,6 +39,7 @@ struct intel_context {
 
 struct intel_renderer {
 	struct wld_renderer base;
+	struct wld_context *context;
 	struct intel_batch batch;
 	struct intel_buffer *target;
 };
@@ -128,6 +129,7 @@ context_create_renderer(struct wld_context *base)
 		goto error1;
 
 	renderer_initialize(&renderer->base, &wld_renderer_impl);
+	renderer->context = base;
 
 	return &renderer->base;
 
@@ -160,6 +162,9 @@ new_buffer(uint32_t width, uint32_t height,
            uint32_t format, uint32_t pitch,
            drm_intel_bo *bo)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct intel_buffer *buffer;
 
 	if (!(buffer = malloc(sizeof *buffer)))
@@ -179,9 +184,14 @@ context_create_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t flags)
 {
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
+
 	struct intel_context *context = intel_context(base);
 	struct buffer *buffer;
 	drm_intel_bo *bo;
+	if (width > INT16_MAX || height > INT16_MAX)
+		return NULL;
 	uint32_t tiling_mode = width >= 128 && !(flags & WLD_FLAG_CURSOR) ? I915_TILING_X : I915_TILING_NONE;
 	unsigned long pitch;
 
@@ -190,6 +200,8 @@ context_create_buffer(struct wld_context *base,
 
 	if (!bo)
 		goto error0;
+	if (pitch > INT32_MAX)
+		goto error1;
 
 	if (!(buffer = new_buffer(width, height, format, pitch, bo)))
 		goto error1;
@@ -208,13 +220,19 @@ context_import_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch) ||
+	    width > INT16_MAX || height > INT16_MAX)
+		return NULL;
+
 	struct intel_context *context = intel_context(base);
 	struct buffer *buffer;
 	drm_intel_bo *bo;
 
 	switch (type) {
 	case WLD_DRM_OBJECT_PRIME_FD: {
-		uint32_t size = width * height * format_bytes_per_pixel(format);
+		if ((uint64_t)pitch * height > INT_MAX)
+			return NULL;
+		uint32_t size = (uint32_t)((uint64_t)pitch * height);
 		bo = drm_intel_bo_gem_create_from_prime(context->bufmgr,
 		                                        object.i, size);
 		break;
@@ -225,6 +243,8 @@ context_import_buffer(struct wld_context *base,
 
 	if (!bo)
 		goto error0;
+	if (pitch > INT32_MAX)
+		goto error1;
 
 	if (!(buffer = new_buffer(width, height, format, pitch, bo)))
 		goto error1;
@@ -314,9 +334,30 @@ renderer_draw_text(struct wld_renderer *base,
 	uint32_t row;
 	FT_UInt glyph_index;
 	uint32_t c;
-	uint8_t immediate[512];
+	uint32_t immediate[254];
 	uint8_t *byte;
 	int32_t origin_x = x;
+
+	if (length == UINT32_MAX)
+		length = strlen(text);
+	const char *cursor = text;
+	uint32_t remaining = length;
+	while ((ret = FcUtf8ToUcs4((FcChar8 *)cursor, &c, remaining)) > 0 && c) {
+		cursor += ret;
+		remaining -= ret;
+		glyph_index = FT_Get_Char_Index(font->face, c);
+		if (!font_ensure_glyph(font, glyph_index))
+			continue;
+		glyph = font->glyphs[glyph_index];
+		uint64_t packed = ((uint64_t)glyph->bitmap.width + 7) / 8 * glyph->bitmap.rows;
+		if (packed > sizeof immediate ||
+		    (glyph->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY &&
+		     glyph->bitmap.pixel_mode != FT_PIXEL_MODE_MONO)) {
+			default_draw_text(base, renderer->context, font, color, x, y,
+			                  text, length, extents);
+			return;
+		}
+	}
 
 	xy_setup_blt(&renderer->batch, true, BLT_RASTER_OPERATION_SRC,
 	             0, color, dst->bo, dst->base.base.pitch);
@@ -337,12 +378,20 @@ renderer_draw_text(struct wld_renderer *base,
 		if (glyph->bitmap.width == 0 || glyph->bitmap.rows == 0)
 			goto advance;
 
-		byte = immediate;
+		uint32_t bytes_per_row = (glyph->bitmap.width + 7) / 8;
+		if (glyph->bitmap.pixel_mode != FT_PIXEL_MODE_MONO &&
+		    glyph->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY)
+			goto advance;
+		/* The command length is eight bits and includes one header dword. */
+		if (!bytes_per_row || glyph->bitmap.rows > sizeof immediate / bytes_per_row)
+			goto advance;
+		memset(immediate, 0, sizeof immediate);
+		byte = (uint8_t *)immediate;
 
 		/* XY_TEXT_IMMEDIATE requires a pitch with no extra bytes */
 		for (row = 0; row < glyph->bitmap.rows; ++row) {
 			const uint8_t *src = glyph->bitmap.buffer +
-			                     (row * glyph->bitmap.pitch);
+			                     ((ptrdiff_t)row * glyph->bitmap.pitch);
 			uint32_t bytes_per_row = (glyph->bitmap.width + 7) / 8;
 
 			if (glyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
@@ -358,7 +407,7 @@ renderer_draw_text(struct wld_renderer *base,
 		                            origin_x + glyph->x, y + glyph->y,
 		                            origin_x + glyph->x + glyph->bitmap.width,
 		                            y + glyph->y + glyph->bitmap.rows,
-		                            (byte - immediate + 3) / 4,
+		                            (byte - (uint8_t *)immediate + 3) / 4,
 		                            (uint32_t *)immediate);
 
 		if (ret == INTEL_BATCH_NO_SPACE) {

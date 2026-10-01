@@ -41,11 +41,9 @@
 #include <GLES2/gl2ext.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <poll.h>
 #include <stdio.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <drm_fourcc.h>
 #include <gbm.h>
 #include <stdlib.h>
@@ -120,6 +118,8 @@ struct gbm_context {
 	bool has_fence_sync;
 	/* Set when our own rendering can be exported as a sync_file. */
 	bool has_native_fence;
+	/* NVIDIA GPU-side imported waits leak fds; use nonblocking fence polling. */
+	bool poll_fences;
 	/*
 	 * Set while rendering has been submitted without being waited for, which
 	 * a CPU mapping of one of our buffers has to catch up on first.
@@ -175,17 +175,18 @@ struct gbm_buffer {
 	struct wld_exporter exporter;
 	struct gbm_context *context;
 
-	/* NULL for buffers imported from a client's dmabuf. */
+	/* GBM owns KMS handles, including aliases of imported dma-bufs. */
 	struct gbm_bo *bo;
 	EGLImageKHR image;
 	GLuint texture;
 	uint32_t handle;
-	bool own_handle;
+	bool imported;
+	struct wld_drm_layout layout;
 	void *map_data;
 
 	/*
-	 * An imported buffer has no gbm_bo to ask for its layout, so keep the
-	 * modifier the client declared. Reporting LINEAR for a tiled import
+	 * An imported buffer retains the layout its client declared, including the
+	 * implicit INVALID modifier. Reporting LINEAR for a tiled import
 	 * would build a DRM framebuffer that scans out garbage. Buffers we
 	 * allocate without a bo are linear dumb buffers, and calloc already
 	 * leaves this at DRM_FORMAT_MOD_LINEAR (0) for them.
@@ -214,6 +215,8 @@ struct gbm_buffer {
 	 * `damage_reported` tells that flush it need not assume the worst.
 	 */
 	bool dirty;
+	/* The GPU texture is newer than the CPU mirror until read back. */
+	bool gpu_dirty;
 	bool damage_reported;
 	pixman_region32_t dirty_region;
 };
@@ -611,6 +614,10 @@ driver_create_context(int drm_fd)
 		const char *gl_ext = (const char *)glGetString(GL_EXTENSIONS);
 		context->has_unpack_subimage =
 		    has_extension(gl_ext, "GL_EXT_unpack_subimage");
+		if (!has_extension(gl_ext, "GL_EXT_texture_format_BGRA8888")) {
+			DEBUG("Required BGRA texture upload support is unavailable\n");
+			goto error3;
+		}
 	}
 
 	/*
@@ -636,6 +643,8 @@ driver_create_context(int drm_fd)
 	glDisable(GL_BLEND);
 	context->gl.blend = 0;
 	context->gl.scissor = -1;
+	const char *vendor = (const char *)glGetString(GL_VENDOR);
+	context->poll_fences = vendor && strstr(vendor, "NVIDIA");
 	context->fence_fd = -1;
 
 	context_initialize(&context->base, &wld_context_impl);
@@ -749,7 +758,17 @@ batch_flush(struct gbm_context *context)
 	             context->batch.quads * QUAD_FLOATS * sizeof(GLfloat),
 	             context->verts, GL_STREAM_DRAW);
 	glDrawArrays(GL_TRIANGLES, 0, context->batch.quads * 6);
+	struct wld_buffer *target = context->batch.renderer->base.target;
+	if (target) {
+		struct gbm_buffer *buffer = gbm_buffer(target);
+		if (buffer->cpu && !buffer->upload_only) {
+			buffer->gpu_dirty = true;
+			buffer->dirty = false;
+			pixman_region32_clear(&buffer->dirty_region);
+		}
+	}
 	context->batch.quads = 0;
+	context->unfinished = true;
 	++context->submissions;
 }
 
@@ -783,6 +802,10 @@ batch_begin(struct gles_renderer *renderer, GLuint program, GLuint texture,
 static GLfloat *
 batch_reserve(struct gbm_context *context, size_t quads)
 {
+	if (quads > INT32_MAX / 6)
+		return NULL;
+	if (context->batch.quads > INT32_MAX / 6 - quads)
+		batch_flush(context);
 	GLfloat *v = reserve_quads(context, context->batch.quads + quads);
 
 	if (!v)
@@ -825,6 +848,8 @@ delete_texture(struct gbm_context *context, GLuint texture)
 
 /**** Buffer ****/
 
+static bool readback_cpu_buffer(struct gbm_buffer *buffer);
+
 static bool
 export(struct wld_exporter *exporter, struct wld_buffer *base,
        uint32_t type, union wld_object *object)
@@ -838,17 +863,24 @@ export(struct wld_exporter *exporter, struct wld_buffer *base,
 		object->u32 = buffer->handle;
 		return true;
 	case WLD_DRM_OBJECT_MODIFIER:
-		if (buffer->bo) {
+		if (buffer->bo && !buffer->imported) {
 			object->u64 = gbm_bo_get_modifier(buffer->bo);
 			return true;
 		}
 		/* An import keeps the layout it was given; anything else we
 		 * allocated ourselves without a bo is a linear dumb buffer. */
-		object->u64 = buffer->modifier != DRM_FORMAT_MOD_INVALID
-		                  ? buffer->modifier
-		                  : DRM_FORMAT_MOD_LINEAR;
+		object->u64 = buffer->modifier;
+		return true;
+	case WLD_DRM_OBJECT_LAYOUT:
+		if (!buffer->layout.num_planes || !buffer->handle)
+			return false;
+		object->ptr = &buffer->layout;
 		return true;
 	case WLD_DRM_OBJECT_PRIME_FD:
+		if (!buffer->handle || buffer->layout.num_planes != 1 ||
+		    buffer->layout.offsets[0] != 0)
+			return false;
+		batch_flush(buffer->context);
 		/* Whoever gets the descriptor has no fence to go by. */
 		if (buffer->context->unfinished) {
 			glFinish();
@@ -908,24 +940,93 @@ image_from_dmabuf(struct gbm_context *context, int fd, uint32_t width,
 	                             EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 }
 
+static EGLImageKHR
+image_from_bo(struct gbm_context *context, struct gbm_bo *bo)
+{
+	static const EGLint fd_keys[] = {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
+	                                EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT};
+	static const EGLint offset_keys[] = {EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+	                                    EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT};
+	static const EGLint pitch_keys[] = {EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT,
+	                                   EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT};
+	static const EGLint lo_keys[] = {EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+	                                EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT};
+	static const EGLint hi_keys[] = {EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+	                                EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT};
+	int count = gbm_bo_get_plane_count(bo), fds[4];
+	EGLint attribs[48];
+	size_t n = 0;
+	EGLImageKHR image = EGL_NO_IMAGE_KHR;
+	if (count <= 0 || count > 4)
+		return image;
+	attribs[n++] = EGL_WIDTH; attribs[n++] = gbm_bo_get_width(bo);
+	attribs[n++] = EGL_HEIGHT; attribs[n++] = gbm_bo_get_height(bo);
+	attribs[n++] = EGL_LINUX_DRM_FOURCC_EXT; attribs[n++] = gbm_bo_get_format(bo);
+	uint64_t modifier = gbm_bo_get_modifier(bo);
+	for (int i = 0; i < count; ++i)
+		fds[i] = -1;
+	for (int i = 0; i < count; ++i) {
+		if ((fds[i] = gbm_bo_get_fd_for_plane(bo, i)) < 0)
+			goto done;
+		uint32_t offset = gbm_bo_get_offset(bo, i);
+		uint32_t pitch = gbm_bo_get_stride_for_plane(bo, i);
+		if (offset > INT32_MAX || pitch > INT32_MAX)
+			goto done;
+		attribs[n++] = fd_keys[i]; attribs[n++] = fds[i];
+		attribs[n++] = offset_keys[i]; attribs[n++] = offset;
+		attribs[n++] = pitch_keys[i]; attribs[n++] = pitch;
+		if (context->has_modifiers && modifier != DRM_FORMAT_MOD_INVALID) {
+			attribs[n++] = lo_keys[i]; attribs[n++] = (uint32_t)modifier;
+			attribs[n++] = hi_keys[i]; attribs[n++] = modifier >> 32;
+		}
+	}
+	attribs[n++] = EGL_NONE;
+	image = context->create_image(context->display, EGL_NO_CONTEXT,
+	                              EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+done:
+	for (int i = 0; i < count; ++i)
+		if (fds[i] >= 0)
+			close(fds[i]);
+	return image;
+}
+
 static struct buffer *
 new_buffer(struct gbm_context *context, struct gbm_bo *bo, EGLImageKHR image,
-           uint32_t handle, bool own_handle, uint32_t width, uint32_t height,
+           uint32_t handle, uint32_t width, uint32_t height,
            uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct gbm_buffer *buffer;
 
 	if (!(buffer = calloc(1, sizeof *buffer)))
 		return NULL;
 
-	buffer_initialize(&buffer->base, &wld_buffer_impl, width, height, format,
-	                  pitch);
 	buffer->context = context;
 	buffer->bo = bo;
 	buffer->image = image;
 	buffer->texture = 0;
 	buffer->handle = handle;
-	buffer->own_handle = own_handle;
+	buffer->layout.num_planes = bo ? gbm_bo_get_plane_count(bo) : (handle ? 1 : 0);
+	if ((bo && !buffer->layout.num_planes) ||
+	    buffer->layout.num_planes > ARRAY_LENGTH(buffer->layout.handles)) {
+		free(buffer);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < buffer->layout.num_planes; ++i) {
+		buffer->layout.handles[i] = bo ? gbm_bo_get_handle_for_plane(bo, i).u32 : handle;
+		buffer->layout.pitches[i] = bo ? gbm_bo_get_stride_for_plane(bo, i) : pitch;
+		buffer->layout.offsets[i] = bo ? gbm_bo_get_offset(bo, i) : 0;
+		buffer->layout.modifiers[i] = bo ? gbm_bo_get_modifier(bo) : DRM_FORMAT_MOD_LINEAR;
+		if (!buffer->layout.handles[i] || buffer->layout.pitches[i] > INT32_MAX ||
+		    buffer->layout.offsets[i] > INT32_MAX) {
+			free(buffer);
+			return NULL;
+		}
+	}
+	buffer_initialize(&buffer->base, &wld_buffer_impl, width, height, format,
+	                  pitch);
 	buffer->map_data = NULL;
 	pixman_region32_init(&buffer->dirty_region);
 	buffer->exporter.export = &export;
@@ -938,12 +1039,17 @@ struct buffer *
 context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
                       uint32_t format, uint32_t flags)
 {
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
 	struct gbm_context *context = gbm_context(base);
 	struct gbm_bo *bo;
 	EGLImageKHR image;
 	struct buffer *buffer;
 	uint32_t usage = GBM_BO_USE_RENDERING;
-	int fd;
+	GLint max_texture = 0;
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture);
+	if (max_texture <= 0 || width > (uint32_t)max_texture || height > (uint32_t)max_texture)
+		return NULL;
 
 	/*
 	 * A buffer the CPU has to write cannot be a GBM buffer here. NVIDIA
@@ -993,13 +1099,17 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 			if (drmIoctl(context->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
 				goto error_dumb;
 
+			if (create_dumb.size > SIZE_MAX ||
+			    !buffer_layout_valid(width, height, format, create_dumb.pitch))
+				goto error_dumb;
+
 			data = mmap(NULL, create_dumb.size, PROT_READ | PROT_WRITE,
 			            MAP_SHARED, context->fd, map_dumb.offset);
 			if (data == MAP_FAILED)
 				goto error_dumb;
 
 			buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR,
-			                    create_dumb.handle, false, width, height,
+			                    create_dumb.handle, width, height,
 			                    format, create_dumb.pitch);
 			if (!buffer) {
 				munmap(data, create_dumb.size);
@@ -1026,7 +1136,7 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 		 * of them to keep here, and none to make on the way in.
 		 */
 		if (flags & WLD_FLAG_UPLOAD) {
-			buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, false,
+			buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0,
 			                    width, height, format, pitch);
 			if (!buffer)
 				return NULL;
@@ -1048,7 +1158,7 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 			return NULL;
 		}
 
-		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, false, width,
+		buffer = new_buffer(context, NULL, EGL_NO_IMAGE_KHR, 0, width,
 		                    height, format, pitch);
 		if (!buffer) {
 			if (mapped) munmap(data, size);
@@ -1073,20 +1183,14 @@ context_create_buffer(struct wld_context *base, uint32_t width, uint32_t height,
 		return NULL;
 	}
 
-	if ((fd = gbm_bo_get_fd(bo)) < 0)
-		goto error0;
-
-	image = image_from_dmabuf(context, fd, width, height, format,
-	                          gbm_bo_get_stride(bo), gbm_bo_get_offset(bo, 0),
-	                          gbm_bo_get_modifier(bo));
-	close(fd);
+	image = image_from_bo(context, bo);
 
 	if (image == EGL_NO_IMAGE_KHR) {
 		DEBUG("failed to create EGLImage for new buffer\n");
 		goto error0;
 	}
 
-	buffer = new_buffer(context, bo, image, gbm_bo_get_handle(bo).u32, false,
+	buffer = new_buffer(context, bo, image, gbm_bo_get_handle(bo).u32,
 	                    width, height, format, gbm_bo_get_stride(bo));
 	if (!buffer)
 		goto error1;
@@ -1121,6 +1225,8 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 		break;
 	case WLD_DRM_OBJECT_DMABUF: {
 		const struct wld_dmabuf_attributes *attributes = object.ptr;
+		if (!attributes)
+			return NULL;
 
 		fd = attributes->fd;
 		offset = attributes->offset;
@@ -1132,6 +1238,11 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 		return NULL;
 	}
 
+	if (!buffer_layout_valid(width, height, format, pitch) ||
+	    offset > INT32_MAX || (uint64_t)offset + (uint64_t)pitch * (height - 1) +
+	                           (uint64_t)width * 4 > SIZE_MAX)
+		return NULL;
+
 	image = image_from_dmabuf(context, fd, width, height, format, pitch, offset,
 	                          modifier);
 	if (image == EGL_NO_IMAGE_KHR) {
@@ -1139,23 +1250,40 @@ context_import_buffer(struct wld_context *base, uint32_t type,
 		return NULL;
 	}
 
-	/* Needed only if this buffer is ever scanned out directly. */
-	if (drmPrimeFDToHandle(context->fd, fd, &handle) != 0)
-		handle = 0;
-
-	buffer = new_buffer(context, NULL, image, handle, handle != 0, width,
-	                    height, format, pitch);
+	struct gbm_bo *bo = NULL;
+	if (modifier != DRM_FORMAT_MOD_INVALID && offset <= INT32_MAX) {
+		struct gbm_import_fd_modifier_data attributes = {
+			.width = width, .height = height, .format = format, .num_fds = 1,
+			.fds = {fd}, .strides = {(int)pitch}, .offsets = {(int)offset},
+			.modifier = modifier,
+		};
+		bo = gbm_bo_import(context->gbm, GBM_BO_IMPORT_FD_MODIFIER,
+		                   &attributes, GBM_BO_USE_SCANOUT);
+	} else if (offset == 0) {
+		struct gbm_import_fd_data attributes = {
+			.fd = fd, .width = width, .height = height,
+			.stride = pitch, .format = format,
+		};
+		bo = gbm_bo_import(context->gbm, GBM_BO_IMPORT_FD, &attributes,
+		                   GBM_BO_USE_SCANOUT);
+	}
+	/* A failed KMS import does not prevent sampling the EGLImage. */
+	handle = bo ? gbm_bo_get_handle(bo).u32 : 0;
+	buffer = new_buffer(context, bo, image, handle, width, height, format, pitch);
 	if (!buffer) {
 		context->destroy_image(context->display, image);
-		/* new_buffer took no ownership, so the handle is still ours. */
-		if (handle) {
-			struct drm_gem_close close_arg = { .handle = handle };
-			drmIoctl(context->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
-		}
+		if (bo)
+			gbm_bo_destroy(bo);
 		return NULL;
 	}
-
-	gbm_buffer(&buffer->base)->modifier = modifier;
+	struct gbm_buffer *imported = gbm_buffer(&buffer->base);
+	imported->imported = true;
+	imported->modifier = modifier;
+	if (handle && imported->layout.num_planes == 1) {
+		imported->layout.pitches[0] = pitch;
+		imported->layout.offsets[0] = offset;
+		imported->layout.modifiers[0] = modifier;
+	}
 
 	return buffer;
 }
@@ -1174,6 +1302,8 @@ context_query_modifiers(struct wld_context *base, uint32_t format,
 		return -1;
 	if (max <= 0)
 		return 0;
+	if (!modifiers || !format_bytes_per_pixel(format))
+		return -1;
 	if (!context->query_dmabuf_modifiers(context->display, format, 0, NULL, NULL,
 	                                     &count))
 		return -1;
@@ -1193,7 +1323,8 @@ context_query_modifiers(struct wld_context *base, uint32_t format,
 	}
 	/* Our shaders sample GL_TEXTURE_2D, not GL_TEXTURE_EXTERNAL_OES. */
 	for (int i = 0; i < count && i < capacity && written < max; ++i) {
-		if (!external_only[i])
+		if (!external_only[i] &&
+		    gbm_device_get_format_modifier_plane_count(context->gbm, format, available[i]) == 1)
 			modifiers[written++] = available[i];
 	}
 done:
@@ -1234,10 +1365,10 @@ buffer_map(struct buffer *base)
 
 	/* Dumb buffers stay mapped for their lifetime. */
 	if (buffer->cpu)
-		return base->base.map != NULL;
+		return !buffer->upload_only && readback_cpu_buffer(buffer);
 
 	/* Imported client dmabufs are not CPU accessible through GBM. */
-	if (!buffer->bo)
+	if (!buffer->bo || buffer->imported)
 		return false;
 
 	/* The GPU may still be writing it; see renderer_flush(). */
@@ -1319,6 +1450,12 @@ buffer_flush(struct buffer *base)
 	 * that renderer said where, it could have been anywhere.
 	 */
 	if (buffer->cpu && !buffer->upload_only) {
+		if (buffer->gpu_dirty) {
+			if (!readback_cpu_buffer(buffer))
+				DEBUG("Failed to read back CPU buffer after GPU drawing\n");
+			buffer->damage_reported = false;
+			return;
+		}
 		if (!buffer->damage_reported)
 			buffer->dirty = true;
 		buffer->damage_reported = false;
@@ -1359,10 +1496,6 @@ buffer_destroy(struct buffer *base)
 	}
 	if (buffer->bo)
 		gbm_bo_destroy(buffer->bo);
-	else if (buffer->own_handle) {
-		struct drm_gem_close close_arg = { .handle = buffer->handle };
-		drmIoctl(buffer->context->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
-	}
 
 	free(buffer);
 }
@@ -1435,7 +1568,7 @@ upload_region(struct gbm_context *context, const uint8_t *pixels,
 }
 
 /* Give a CPU buffer's texture its storage, blank, the first time. */
-static void
+static bool
 allocate_texture_storage(struct gbm_buffer *buffer)
 {
 	uint32_t width = buffer->base.base.width;
@@ -1443,14 +1576,17 @@ allocate_texture_storage(struct gbm_buffer *buffer)
 	void *zero;
 
 	if (buffer->tex_allocated)
-		return;
+		return true;
 	/* Blank rather than undefined: the edges of what is uploaded later are
 	 * filtered against their neighbours. */
 	zero = calloc((size_t)width * 4, height);
+	if (!zero)
+		return false;
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, width, height, 0, GL_BGRA_EXT,
 	             GL_UNSIGNED_BYTE, zero);
 	free(zero);
-	buffer->tex_allocated = true;
+	buffer->tex_allocated = glGetError() == GL_NO_ERROR;
+	return buffer->tex_allocated;
 }
 
 /* Lazily wrap a buffer's EGLImage in a GL texture. */
@@ -1465,6 +1601,8 @@ buffer_texture(struct gbm_buffer *buffer)
 			return 0;
 
 		glGenTextures(1, &buffer->texture);
+		if (!buffer->texture)
+			return 0;
 		bind_texture_for_upload(context, buffer->texture);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1482,7 +1620,8 @@ buffer_texture(struct gbm_buffer *buffer)
 		if (!buffer->tex_allocated) {
 			bind_texture_for_upload(context, buffer->texture);
 			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-			allocate_texture_storage(buffer);
+			if (!allocate_texture_storage(buffer))
+				return 0;
 		}
 		return buffer->texture;
 	}
@@ -1497,7 +1636,8 @@ buffer_texture(struct gbm_buffer *buffer)
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
 		/* Allocate storage once; refreshes are sub-image updates. */
-		allocate_texture_storage(buffer);
+		if (!allocate_texture_storage(buffer))
+			return 0;
 
 		if (fresh || buffer->dirty) {
 			pixman_region32_t full;
@@ -1521,6 +1661,46 @@ buffer_texture(struct gbm_buffer *buffer)
 	return buffer->texture;
 }
 
+/* Synchronize a mapped buffer's CPU mirror with writes to its texture. */
+static bool
+readback_cpu_buffer(struct gbm_buffer *buffer)
+{
+	struct gbm_context *context = buffer->context;
+	if (!buffer->base.base.map)
+		return false;
+	batch_flush(context);
+	if (!buffer->gpu_dirty)
+		return true;
+
+	GLuint fbo;
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D, buffer->texture, 0);
+	bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	if (complete) {
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		for (uint32_t row = 0; row < buffer->base.base.height; ++row) {
+			uint8_t *pixels = (uint8_t *)buffer->base.base.map +
+			                  (size_t)row * buffer->base.base.pitch;
+			/* RGBA/UNSIGNED_BYTE is guaranteed for GLES2 readback. */
+			glReadPixels(0, row, buffer->base.base.width, 1, GL_RGBA,
+			             GL_UNSIGNED_BYTE, pixels);
+			for (uint32_t x = 0; x < buffer->base.base.width; ++x) {
+				uint8_t red = pixels[x * 4];
+				pixels[x * 4] = pixels[x * 4 + 2];
+				pixels[x * 4 + 2] = red;
+			}
+		}
+		complete = glGetError() == GL_NO_ERROR;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, context->gl.fbo);
+	glDeleteFramebuffers(1, &fbo);
+	if (complete)
+		buffer->gpu_dirty = false;
+	return complete;
+}
+
 /*
  * Copy a region of the caller's pixels into the texture, straight from where
  * they are. This is how a client's shared memory reaches the GPU: one copy,
@@ -1537,7 +1717,8 @@ buffer_upload(struct buffer *base, const void *pixels, uint32_t pitch,
 
 	/* Rows have to start on a 4-byte boundary for the unpack alignment,
 	 * and only 32-bit formats are uploaded here. */
-	if (!buffer->cpu || !pixels || pitch % 4 || pitch < 4)
+	if (!buffer->cpu || !pixels || !region || pitch % 4 || pitch < 4 ||
+	    base->base.height > SIZE_MAX / pitch)
 		return false;
 	if (!buffer_texture(buffer))
 		return false;
@@ -1549,9 +1730,31 @@ buffer_upload(struct buffer *base, const void *pixels, uint32_t pitch,
 	                               base->base.width < pitch / 4 ? base->base.width : pitch / 4,
 	                               base->base.height);
 	if (pixman_region32_not_empty(&clipped)) {
+		if (!buffer->upload_only) {
+			if (!readback_cpu_buffer(buffer)) {
+				pixman_region32_fini(&clipped);
+				return false;
+			}
+			int count;
+			pixman_box32_t *boxes = pixman_region32_rectangles(&clipped, &count);
+			for (int i = 0; i < count; ++i) {
+				for (int32_t y = boxes[i].y1; y < boxes[i].y2; ++y) {
+					memmove((uint8_t *)base->base.map + (size_t)y * base->base.pitch +
+					            (size_t)boxes[i].x1 * 4,
+					        (const uint8_t *)pixels + (size_t)y * pitch +
+					            (size_t)boxes[i].x1 * 4,
+					        (size_t)(boxes[i].x2 - boxes[i].x1) * 4);
+				}
+			}
+			pixels = base->base.map;
+			pitch = base->base.pitch;
+		}
 		bind_texture_for_upload(context, buffer->texture);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-		allocate_texture_storage(buffer);
+		if (!allocate_texture_storage(buffer)) {
+			pixman_region32_fini(&clipped);
+			return false;
+		}
 		upload_region(context, pixels, pitch, base->base.width, &clipped);
 	}
 	pixman_region32_fini(&clipped);
@@ -1609,9 +1812,15 @@ bind_target(struct gles_renderer *renderer)
 		batch_flush(context);
 		if (renderer->clip_enabled) {
 			glEnable(GL_SCISSOR_TEST);
-			glScissor(renderer->clip.x1, renderer->clip.y1,
-			          renderer->clip.x2 - renderer->clip.x1,
-			          renderer->clip.y2 - renderer->clip.y1);
+			int64_t x1 = renderer->clip.x1, y1 = renderer->clip.y1;
+			int64_t x2 = renderer->clip.x2, y2 = renderer->clip.y2;
+			if (x1 < 0) x1 = 0;
+			if (y1 < 0) y1 = 0;
+			if (x2 > renderer->target_width) x2 = renderer->target_width;
+			if (y2 > renderer->target_height) y2 = renderer->target_height;
+			if (x1 > renderer->target_width) x1 = renderer->target_width;
+			if (y1 > renderer->target_height) y1 = renderer->target_height;
+			glScissor(x1, y1, x2 > x1 ? x2 - x1 : 0, y2 > y1 ? y2 - y1 : 0);
 			context->gl.scissor_box = renderer->clip;
 		} else {
 			glDisable(GL_SCISSOR_TEST);
@@ -1641,7 +1850,11 @@ setup_textured(struct gles_renderer *renderer, struct buffer *src_base,
                bool blend)
 {
 	struct gbm_context *context = renderer->context;
+	if (!src_base || src_base->base.impl != &wld_buffer_impl)
+		return false;
 	struct gbm_buffer *src = gbm_buffer(&src_base->base);
+	if (src->context != context)
+		return false;
 	GLuint texture;
 	bool opaque;
 
@@ -1707,8 +1920,8 @@ composite_region(struct wld_renderer *base, struct buffer *src_base,
 		return;
 
 	for (i = 0; i < count; ++i) {
-		v = put_quad(v, boxes[i].x1 + dst_x, boxes[i].y1 + dst_y,
-		             boxes[i].x2 + dst_x, boxes[i].y2 + dst_y,
+		v = put_quad(v, (GLfloat)boxes[i].x1 + dst_x, (GLfloat)boxes[i].y1 + dst_y,
+		             (GLfloat)boxes[i].x2 + dst_x, (GLfloat)boxes[i].y2 + dst_y,
 		             boxes[i].x1 / src_w, boxes[i].y1 / src_h,
 		             boxes[i].x2 / src_w, boxes[i].y2 / src_h, white);
 	}
@@ -1722,7 +1935,8 @@ renderer_capabilities(struct wld_renderer *base, struct buffer *buffer)
 	 * the GPU. This is what lets the compositor draw client dmabufs, which
 	 * the pixman renderer has to skip.
 	 */
-	if (buffer->base.impl == &wld_buffer_impl)
+	if (buffer->base.impl == &wld_buffer_impl &&
+	    gbm_buffer(&buffer->base)->context == gles_renderer(base)->context)
 		return WLD_CAPABILITY_READ | WLD_CAPABILITY_WRITE;
 
 	return 0;
@@ -1742,7 +1956,8 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 		return true;
 	}
 
-	if (buffer->base.impl != &wld_buffer_impl)
+	if (buffer->base.impl != &wld_buffer_impl ||
+	    gbm_buffer(&buffer->base)->context != context)
 		return false;
 
 	if (!(texture = buffer_texture(gbm_buffer(&buffer->base))))
@@ -1775,6 +1990,7 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	}
 
 	renderer->target_texture = texture;
+	context->gl.scissor = -1;
 	if (renderer->target_width != buffer->base.width
 	    || renderer->target_height != buffer->base.height
 	    || !renderer->proj[15]) {
@@ -1835,7 +2051,8 @@ renderer_copy_rectangle(struct wld_renderer *base, struct buffer *src,
 	pixman_region32_t region;
 
 	pixman_region32_init_rect(&region, src_x, src_y, width, height);
-	composite_region(base, src, dst_x - src_x, dst_y - src_y, &region, false);
+	composite_region(base, src, (int32_t)((int64_t)dst_x - src_x),
+	                 (int32_t)((int64_t)dst_y - src_y), &region, false);
 	pixman_region32_fini(&region);
 }
 
@@ -1910,6 +2127,12 @@ atlas_create(struct gbm_context *context)
 	}
 
 	glGenTextures(1, &atlas->texture);
+	if (!atlas->texture) {
+		free(zero);
+		free(atlas->slots);
+		atlas->slots = NULL;
+		return false;
+	}
 	bind_texture_for_upload(context, atlas->texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1927,12 +2150,23 @@ atlas_create(struct gbm_context *context)
  * Forget every glyph. Draws already issued keep what they sampled: GL orders
  * the uploads that later overwrite the texels after them.
  */
-static void
-atlas_reset(struct glyph_atlas *atlas)
+static bool
+atlas_reset(struct gbm_context *context)
 {
+	struct glyph_atlas *atlas = &context->atlas;
+	void *zero = calloc(atlas->size, atlas->size);
+	if (!zero)
+		return false;
+	bind_texture_for_upload(context, atlas->texture);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, atlas->size, atlas->size,
+	                GL_ALPHA, GL_UNSIGNED_BYTE, zero);
+	free(zero);
+	++context->submissions;
 	memset(atlas->slots, 0, GLYPH_TABLE_SIZE * sizeof *atlas->slots);
 	atlas->count = 0;
 	atlas->shelf_x = atlas->shelf_y = atlas->shelf_height = 0;
+	return true;
 }
 
 enum glyph_result {
@@ -2091,8 +2325,8 @@ renderer_draw_text(struct wld_renderer *base, struct font *font, uint32_t color,
 		result = atlas_glyph(context, glyph, &slot);
 		if (result == GLYPH_FULL) {
 			batch_flush(context);
-			atlas_reset(&context->atlas);
-			result = atlas_glyph(context, glyph, &slot);
+			if (atlas_reset(context))
+				result = atlas_glyph(context, glyph, &slot);
 		}
 
 		if (result == GLYPH_OK) {
@@ -2129,6 +2363,7 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
 
 	if (!bind_target(renderer) || !data || x < 0 || y < 0 ||
 	    width == 0 || height == 0 || pitch < row_bytes ||
+	    height > SIZE_MAX / pitch ||
 	    (uint64_t)x + width > renderer->target_width ||
 	    (uint64_t)y + height > renderer->target_height)
 		return false;
@@ -2142,191 +2377,61 @@ renderer_read_pixels(struct wld_renderer *base, int32_t x, int32_t y,
 	 * be filled a row at a time. glReadPixels' y origin matches ours, since
 	 * rendering into an FBO puts window y 0 at the first row in memory.
 	 */
-	if (pitch == row_bytes) {
-		glReadPixels(x, y, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
-	} else {
-		uint32_t row;
-
-		for (row = 0; row < height; ++row) {
-			glReadPixels(x, y + (int32_t)row, width, 1, GL_BGRA_EXT,
-			             GL_UNSIGNED_BYTE, (uint8_t *)data + (size_t)row * pitch);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	for (uint32_t row = 0; row < height; ++row) {
+		uint8_t *pixels = (uint8_t *)data + (size_t)row * pitch;
+		glReadPixels(x, y + (int32_t)row, width, 1, GL_RGBA,
+		             GL_UNSIGNED_BYTE, pixels);
+		for (uint32_t col = 0; col < width; ++col) {
+			uint8_t red = pixels[col * 4];
+			pixels[col * 4] = pixels[col * 4 + 2];
+			pixels[col * 4 + 2] = red;
 		}
 	}
 
 	return glGetError() == GL_NO_ERROR;
 }
 
-/*
- * How this driver behaves around fence synchronization, learned on the first
- * fence rather than assumed.
- *
- * Two things vary, and the NVIDIA driver gets both wrong in ways that matter:
- *
- *  - Ownership of the descriptor handed to eglCreateSyncKHR.
- *    EGL_ANDROID_native_fence_sync says the implementation takes it when the
- *    call succeeds and closes it with the sync object. Closing it ourselves
- *    against a driver that does that is a double close of a descriptor number
- *    the driver may have reused, so we have to know rather than guess.
- *
- *  - Whether the GPU-side wait leaks. On this driver eglWaitSyncKHR leaks one
- *    sync_file descriptor per call, permanently: create and destroy alone
- *    balance, and adding the wait costs exactly one descriptor every time.
- *    At one synchronized commit per client frame that exhausts a compositor's
- *    descriptor table in minutes, and everything downstream of a descriptor
- *    then fails at once -- clients cannot send buffers, and this function
- *    stops working, which removes the very wait it exists to perform.
- *
- * So run one full create/wait/destroy cycle with both questions instrumented,
- * and act on the answers from then on. Where the wait leaks, only report
- * whether the fence has already signalled: a sync_file becomes readable when
- * its fence signals, so the caller can wait for exactly that event in its own
- * event loop instead of blocking here.
- */
-enum fence_fd_ownership {
-	FENCE_FD_UNKNOWN,
-	FENCE_FD_CONSUMED, /* the driver closed it; it is not ours to close */
-	FENCE_FD_RETAINED, /* the driver left it open; we still own it */
-};
-
-static enum fence_fd_ownership fence_fd_ownership;
-static bool gpu_wait_leaks;
-static bool fence_behavior_known;
-
-/*
- * How many descriptors the process has open, or -1 where that cannot be asked.
- *
- * Counting is the only reliable way to see this leak: the descriptor the
- * driver keeps lands in the slot the descriptor it consumed just vacated, so
- * the lowest free number does not move even though one was kept.
- */
-static int
-count_open_fds(void)
-{
-#ifdef __linux__
-	DIR *dir = opendir("/proc/self/fd");
-	struct dirent *entry;
-	int total = 0;
-
-	if (!dir)
-		return -1;
-	while ((entry = readdir(dir))) {
-		if (entry->d_name[0] != '.')
-			++total;
-	}
-	closedir(dir);
-	/* The walk listed the descriptor it was walking with. */
-	return total > 0 ? total - 1 : 0;
-#else
-	return -1;
-#endif
-}
-
-static bool
-same_open_file(int fd, const struct stat *before)
-{
-	struct stat now;
-
-	return fstat(fd, &now) == 0 && now.st_dev == before->st_dev
-	       && now.st_ino == before->st_ino;
-}
-
-/* A sync_file signals by becoming readable. This only looks; it never waits. */
+/* A sync_file signals by becoming readable. Invalid/error fds are not fences. */
 static bool
 fence_signalled(int fence_fd)
 {
 	struct pollfd pollfd = {.fd = fence_fd, .events = POLLIN};
 	int ret;
-
 	do {
 		ret = poll(&pollfd, 1, 0);
 	} while (ret < 0 && errno == EINTR);
-
-	return ret > 0;
+	return ret > 0 && (pollfd.revents & POLLIN) &&
+	       !(pollfd.revents & (POLLERR | POLLNVAL));
 }
 
 bool
 renderer_wait_fence(struct wld_renderer *base, int fence_fd)
 {
-	struct gles_renderer *renderer = gles_renderer(base);
-	struct gbm_context *context = renderer->context;
-	EGLSyncKHR sync;
-	EGLint attribs[3];
-	struct stat identity;
-	bool probing, probe_identity, waited;
-	int dup_fd, open_before = -1;
-
+	struct gbm_context *context = gles_renderer(base)->context;
 	if (!context->has_fence_sync)
 		return false;
-
-	/* A negative descriptor only asks whether fences are supported. */
 	if (fence_fd < 0)
 		return true;
-
-	if (gpu_wait_leaks)
+	/* NVIDIA's imported GPU wait leaks descriptors. Poll in the caller's
+	 * event loop instead, without a probe that may close a reused fd. */
+	if (context->poll_fences)
 		return fence_signalled(fence_fd);
-
-	probing = !fence_behavior_known;
-	/* Counted before our own duplicate exists, and compared after it is gone
-	 * again, so only what the driver kept is left in the difference. */
-	if (probing)
-		open_before = count_open_fds();
-
-	/* The caller keeps its own descriptor whatever the driver does with ours. */
-	if ((dup_fd = fcntl(fence_fd, F_DUPFD_CLOEXEC, 0)) < 0)
+	int dup_fd = fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
+	if (dup_fd < 0)
 		return false;
-
-	probe_identity = probing && fstat(dup_fd, &identity) == 0;
-
-	attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
-	attribs[1] = dup_fd;
-	attribs[2] = EGL_NONE;
-
-	sync = context->create_sync(context->display,
-	                            EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+	EGLint attribs[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, dup_fd, EGL_NONE};
+	EGLSyncKHR sync = context->create_sync(context->display,
+	                                      EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
 	if (sync == EGL_NO_SYNC_KHR) {
-		/* Ownership only ever transfers on success, so this one is ours. */
 		close(dup_fd);
 		return false;
 	}
-
-	/*
-	 * Wait on the GPU rather than the CPU where that works: it only orders the
-	 * commands queued after it, and never blocks the caller on a client that
-	 * is slow to finish drawing.
-	 */
-	waited = context->wait_sync(context->display, sync, 0);
+	/* EGL_ANDROID_native_fence_sync transfers fd ownership on success. */
+	batch_flush(context);
+	bool waited = context->wait_sync(context->display, sync, 0);
+	++context->submissions;
 	context->destroy_sync(context->display, sync);
-
-	if (probing) {
-		int open_after;
-
-		if (probe_identity) {
-			fence_fd_ownership = same_open_file(dup_fd, &identity)
-			                         ? FENCE_FD_RETAINED
-			                         : FENCE_FD_CONSUMED;
-		}
-		/* Take our own descriptor back first, so it is not mistaken for one
-		 * the driver kept. */
-		if (fence_fd_ownership == FENCE_FD_RETAINED)
-			close(dup_fd);
-
-		open_after = count_open_fds();
-		if (open_before >= 0 && open_after > open_before) {
-			gpu_wait_leaks = true;
-			fprintf(stderr,
-			        "wld: this driver leaks a descriptor per GPU fence wait; "
-			        "waiting on fences directly instead\n");
-		}
-		/* Both answers come from this one cycle; do not probe again. */
-		if (probe_identity)
-			fence_behavior_known = true;
-		return waited;
-	}
-
-	/* Unknown only when the probe itself failed: leave the descriptor alone. */
-	if (fence_fd_ownership == FENCE_FD_RETAINED)
-		close(dup_fd);
-
 	return waited;
 }
 
@@ -2459,6 +2564,7 @@ context_create_renderer(struct wld_context *base)
 		return NULL;
 
 	renderer->context = context;
+	batch_flush(context);
 
 	renderer->solid.program = link_program(vertex_solid_src, fragment_solid_src);
 	renderer->textured.program = link_program(vertex_tex_src, fragment_tex_src);

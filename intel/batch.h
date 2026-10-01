@@ -25,7 +25,6 @@
 #define WLD_INTEL_BATCH_H
 
 #include <intel_bufmgr.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -35,7 +34,8 @@
 
 enum intel_batch_result {
 	INTEL_BATCH_SUCCESS,
-	INTEL_BATCH_NO_SPACE
+	INTEL_BATCH_NO_SPACE,
+	INTEL_BATCH_INVALID
 };
 
 struct intel_device_info {
@@ -89,22 +89,16 @@ intel_batch_add_dword(struct intel_batch *batch,
 }
 
 static inline void
-intel_batch_add_dwords_va(struct intel_batch *batch,
-                          uint32_t count, va_list dwords)
+intel_batch_add_dwords_array(struct intel_batch *batch, uint32_t count,
+                            const uint32_t *dwords)
 {
 	while (count--)
-		intel_batch_add_dword(batch, va_arg(dwords, uint32_t));
+		intel_batch_add_dword(batch, *dwords++);
 }
 
-static inline void
-intel_batch_add_dwords(struct intel_batch *batch,
-                       uint32_t count, ...)
-{
-	va_list dwords;
-	va_start(dwords, count);
-	intel_batch_add_dwords_va(batch, count, dwords);
-	va_end(dwords);
-}
+/* Convert every expression to a dword before emitting it, including addresses. */
+#define intel_batch_add_dwords(batch, count, ...) \
+	intel_batch_add_dwords_array((batch), (count), (const uint32_t[]){__VA_ARGS__})
 
 static inline uint32_t
 intel_batch_offset(struct intel_batch *batch,

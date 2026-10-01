@@ -52,6 +52,7 @@ struct nouveau_context {
 
 struct nouveau_renderer {
 	struct wld_renderer base;
+	struct wld_context *context;
 	struct nouveau_object *channel;
 	struct nouveau_pushbuf *pushbuf;
 	struct nouveau_bufctx *bufctx;
@@ -164,16 +165,11 @@ nv_add_dword(struct nouveau_pushbuf *push, uint32_t dword)
 }
 
 static inline void
-nv_add_dwords_va(struct nouveau_pushbuf *push, uint16_t count, va_list dwords)
+nv_add_data(struct nouveau_pushbuf *push, const void *data, size_t bytes)
 {
-	while (count--)
-		nv_add_dword(push, va_arg(dwords, uint32_t));
-}
-
-static inline void
-nv_add_data(struct nouveau_pushbuf *push, void *data, uint32_t count)
-{
-	memcpy(push->cur, data, count * 4);
+	size_t count = (bytes + 3) / 4;
+	memset(push->cur, 0, count * 4);
+	memcpy(push->cur, data, bytes);
 	push->cur += count;
 }
 
@@ -214,20 +210,17 @@ nvc0_inline(struct nouveau_pushbuf *push, uint8_t subchannel, uint16_t method, u
 }
 
 static inline void
-nvc0_methods(struct nouveau_pushbuf *push,
-             uint8_t subchannel, uint16_t start_method,
-             uint16_t count, ...)
+nvc0_methods_array(struct nouveau_pushbuf *push, uint16_t method,
+                   uint16_t count, const uint32_t *dwords)
 {
-	va_list dwords;
 	nv_add_dword(push, nvc0_command(GF100_COMMAND_TYPE_INCREASING,
-	                                subchannel, start_method, count));
-	va_start(dwords, count);
-	nv_add_dwords_va(push, count, dwords);
-	va_end(dwords);
+	                               GF100_SUBCHANNEL_2D, method, count));
+	while (count--)
+		nv_add_dword(push, *dwords++);
 }
 
 #define nvc0_2d(push, method, count, ...) \
-	nvc0_methods(push, GF100_SUBCHANNEL_2D, method, count, __VA_ARGS__)
+	nvc0_methods_array((push), (method), (count), (const uint32_t[]){__VA_ARGS__})
 #define nvc0_2d_inline(push, method, value) \
 	nvc0_inline(push, GF100_SUBCHANNEL_2D, method, value)
 
@@ -297,6 +290,7 @@ context_create_renderer(struct wld_context *base)
 		goto error4;
 
 	renderer_initialize(&renderer->base, &wld_renderer_impl);
+	renderer->context = base;
 	renderer->target = NULL;
 
 	return &renderer->base;
@@ -336,6 +330,9 @@ new_buffer(struct nouveau_context *context,
            uint32_t width, uint32_t height,
            uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct nouveau_buffer *buffer;
 
 	if (!(buffer = malloc(sizeof *buffer)))
@@ -361,39 +358,36 @@ context_create_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t flags)
 {
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
 	struct nouveau_context *context = nouveau_context(base);
-	struct nouveau_buffer *buffer;
-	uint32_t bpp = format_bytes_per_pixel(format),
-	         pitch = roundup(width * bpp, 64), bo_flags;
+	uint32_t bpp = format_bytes_per_pixel(format), storage_height = height;
+	if (width > (UINT32_MAX - 63) / bpp || height > UINT32_MAX - 127)
+		return NULL;
+	uint32_t pitch = roundup(width * bpp, 64), bo_flags = NOUVEAU_BO_VRAM;
 	union nouveau_bo_config config = {};
-
-	if (!(buffer = new_buffer(context, width, height, format, pitch)))
-		goto error0;
-
-	bo_flags = NOUVEAU_BO_VRAM;
-
 	if (flags & WLD_DRM_FLAG_SCANOUT)
 		bo_flags |= NOUVEAU_BO_CONTIG;
-
 	if (height > 0x40 && !(flags & WLD_FLAG_MAP)) {
 		config.nvc0.tile_mode = 0x40;
 		config.nvc0.memtype = 0xfe;
-		height = roundup(height, 0x80);
-	} else
+		storage_height = roundup(height, 0x80);
+	} else {
 		bo_flags |= NOUVEAU_BO_MAP;
-
-	if (nouveau_bo_new(context->device, bo_flags, 0, pitch * height,
-	                   &config, &buffer->bo)
-	    != 0) {
-		goto error1;
 	}
-
+	if ((uint64_t)pitch * storage_height > UINT32_MAX)
+		return NULL;
+	struct nouveau_bo *bo = NULL;
+	if (nouveau_bo_new(context->device, bo_flags, 0,
+	                   (uint64_t)pitch * storage_height, &config, &bo) != 0)
+		return NULL;
+	struct nouveau_buffer *buffer = new_buffer(context, width, height, format, pitch);
+	if (!buffer) {
+		nouveau_bo_ref(NULL, &bo);
+		return NULL;
+	}
+	buffer->bo = bo;
 	return &buffer->base;
-
-error1:
-	free(buffer);
-error0:
-	return NULL;
 }
 
 struct buffer *
@@ -402,6 +396,9 @@ context_import_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct nouveau_context *context = (void *)base;
 	struct nouveau_buffer *buffer;
 	struct nouveau_bo *bo = NULL;
@@ -573,6 +570,30 @@ renderer_draw_text(struct wld_renderer *base,
 	uint32_t c, count;
 	int32_t origin_x = x;
 
+	if (length == UINT32_MAX)
+		length = strlen(text);
+	const char *cursor = text;
+	uint32_t remaining = length;
+	while ((ret = FcUtf8ToUcs4((FcChar8 *)cursor, &c, remaining)) > 0 && c) {
+		cursor += ret;
+		remaining -= ret;
+		glyph_index = FT_Get_Char_Index(font->face, c);
+		if (!font_ensure_glyph(font, glyph_index))
+			continue;
+		glyph = font->glyphs[glyph_index];
+		uint64_t packed = glyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO && glyph->bitmap.pitch > 0
+		                  ? (uint64_t)glyph->bitmap.pitch * glyph->bitmap.rows
+		                  : ((uint64_t)glyph->bitmap.width + 7) / 8 * glyph->bitmap.rows;
+		if (packed > 0x7ff * 4 ||
+		    (glyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO && glyph->bitmap.pitch <= 0) ||
+		    (glyph->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY &&
+		     glyph->bitmap.pixel_mode != FT_PIXEL_MODE_MONO)) {
+			default_draw_text(base, renderer->context, font, color, x, y,
+			                  text, length, extents);
+			return;
+		}
+	}
+
 	if (!ensure_space(renderer->pushbuf, 17))
 		return;
 
@@ -610,10 +631,16 @@ renderer_draw_text(struct wld_renderer *base,
 			goto advance;
 
 		if (glyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
-			count = (glyph->bitmap.pitch * glyph->bitmap.rows + 3) / 4;
+			if (glyph->bitmap.pitch <= 0 ||
+			    (uint64_t)glyph->bitmap.pitch * glyph->bitmap.rows > 0x7ff * 4)
+				goto advance;
+			count = ((size_t)glyph->bitmap.pitch * glyph->bitmap.rows + 3) / 4;
 		} else {
 			uint32_t bytes_per_row = (glyph->bitmap.width + 7) / 8;
-			count = (bytes_per_row * glyph->bitmap.rows + 3) / 4;
+			if (glyph->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY ||
+			    (uint64_t)bytes_per_row * glyph->bitmap.rows > 0x7ff * 4)
+				goto advance;
+			count = ((size_t)bytes_per_row * glyph->bitmap.rows + 3) / 4;
 		}
 
 		if (!ensure_space(renderer->pushbuf, 12 + count))
@@ -630,11 +657,12 @@ renderer_draw_text(struct wld_renderer *base,
 			             nvc0_command(GF100_COMMAND_TYPE_NON_INCREASING,
 			                          GF100_SUBCHANNEL_2D,
 			                          G80_2D_SIFC_DATA, count));
-			nv_add_data(renderer->pushbuf, glyph->bitmap.buffer, count);
+			nv_add_data(renderer->pushbuf, glyph->bitmap.buffer,
+			            (size_t)glyph->bitmap.pitch * glyph->bitmap.rows);
 		} else {
 			uint32_t bytes_per_row = (glyph->bitmap.width + 7) / 8;
 			uint32_t row;
-			uint8_t *mono = malloc(bytes_per_row * glyph->bitmap.rows);
+			uint8_t *mono = malloc((size_t)bytes_per_row * glyph->bitmap.rows);
 			uint8_t *dst = mono;
 
 			if (!mono)
@@ -642,7 +670,7 @@ renderer_draw_text(struct wld_renderer *base,
 
 			for (row = 0; row < glyph->bitmap.rows; ++row) {
 				const uint8_t *src = glyph->bitmap.buffer +
-				                     (row * glyph->bitmap.pitch);
+				                     ((ptrdiff_t)row * glyph->bitmap.pitch);
 				pack_gray_row_to_mono(dst, src, glyph->bitmap.width);
 				dst += bytes_per_row;
 			}
@@ -655,7 +683,8 @@ renderer_draw_text(struct wld_renderer *base,
 			             nvc0_command(GF100_COMMAND_TYPE_NON_INCREASING,
 			                          GF100_SUBCHANNEL_2D,
 			                          G80_2D_SIFC_DATA, count));
-			nv_add_data(renderer->pushbuf, mono, count);
+			nv_add_data(renderer->pushbuf, mono,
+			            (size_t)bytes_per_row * glyph->bitmap.rows);
 			free(mono);
 		}
 
@@ -699,7 +728,7 @@ buffer_map(struct buffer *base)
 	if (buffer->bo->config.nvc0.tile_mode)
 		return false;
 
-	if (nouveau_bo_map(buffer->bo, NOUVEAU_BO_WR,
+	if (nouveau_bo_map(buffer->bo, NOUVEAU_BO_RD | NOUVEAU_BO_WR,
 	                   buffer->context->client)
 	    != 0) {
 		return false;

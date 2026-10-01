@@ -29,12 +29,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define WLD_USER_ID (0xff << 24)
+#define WLD_USER_ID UINT32_C(0xff000000)
 
 #define __WLD_FOURCC(a, b, c, d) ((a)           \
 	                          | ((b) << 8)  \
 	                          | ((c) << 16) \
-	                          | ((d) << 24))
+	                          | ((uint32_t)(d) << 24))
 
 /**
  * Supported pixel formats.
@@ -235,6 +235,9 @@ void wld_destroy_surface(struct wld_surface *surface);
 struct wld_renderer {
 	const struct wld_renderer_impl *const impl;
 	struct wld_buffer *target;
+	/* Shared clip state also confines CPU fallback operations. */
+	bool clip_enabled;
+	pixman_box32_t clip;
 };
 
 enum wld_capability {
@@ -256,6 +259,7 @@ void wld_destroy_renderer(struct wld_renderer *renderer);
 uint32_t wld_capabilities(struct wld_renderer *renderer,
                           struct wld_buffer *buffer);
 
+/* The renderer holds a buffer reference until it is retargeted or flushed. */
 bool wld_set_target_buffer(struct wld_renderer *renderer,
                            struct wld_buffer *buffer);
 
@@ -264,8 +268,8 @@ bool wld_set_target_surface(struct wld_renderer *renderer,
 
 /**
  * Confine drawing to 'box', in target coordinates, or lift the confinement
- * with NULL. Lasts until the target changes. A backend that cannot clip
- * ignores it.
+ * with NULL. Lasts until the target changes. CPU fallbacks and rectangle
+ * operations also respect this clip; hardware text support varies by backend.
  */
 void wld_set_clip(struct wld_renderer *renderer, const pixman_box32_t *box);
 

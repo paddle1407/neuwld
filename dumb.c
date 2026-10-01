@@ -33,9 +33,17 @@
 #include <errno.h>
 #include <string.h>
 
+struct dumb_handle {
+	struct dumb_handle *next;
+	uint32_t handle;
+	unsigned references;
+	bool allocated;
+};
+
 struct dumb_context {
 	struct wld_context base;
 	int fd;
+	struct dumb_handle *handles;
 };
 
 struct dumb_buffer {
@@ -43,6 +51,7 @@ struct dumb_buffer {
 	struct wld_exporter exporter;
 	struct dumb_context *context;
 	uint32_t handle;
+	struct dumb_handle *handle_ref;
 	void *scanout;
 	bool shadowed;
 };
@@ -73,6 +82,7 @@ driver_create_context(int drm_fd)
 
 	context_initialize(&context->base, &wld_context_impl);
 	context->fd = drm_fd;
+	context->handles = NULL;
 
 	return &context->base;
 }
@@ -109,13 +119,31 @@ static struct buffer *
 new_buffer(struct dumb_context *context,
            uint32_t width, uint32_t height,
            uint32_t format, uint32_t handle,
-           unsigned long pitch, bool shadowed)
+           unsigned long pitch, bool shadowed, bool allocated)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct dumb_buffer *buffer;
 
 	if (!(buffer = malloc(sizeof *buffer)))
 		return NULL;
 
+	struct dumb_handle *reference;
+	for (reference = context->handles; reference; reference = reference->next)
+		if (reference->handle == handle)
+			break;
+	if (!reference) {
+		if (!(reference = malloc(sizeof *reference))) {
+			free(buffer);
+			return NULL;
+		}
+		*reference = (struct dumb_handle){.next = context->handles,
+		                                .handle = handle, .allocated = allocated};
+		context->handles = reference;
+	}
+	++reference->references;
+	buffer->handle_ref = reference;
 	buffer_initialize(&buffer->base, &wld_buffer_impl,
 	                  width, height, format, pitch);
 	buffer->context = context;
@@ -133,6 +161,9 @@ context_create_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t flags)
 {
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
+
 	struct dumb_context *context = dumb_context(base);
 	struct buffer *buffer;
 	struct drm_mode_create_dumb create_dumb = {
@@ -146,7 +177,7 @@ context_create_buffer(struct wld_context *base,
 
 	buffer = new_buffer(context, width, height, format,
 	                    create_dumb.handle, create_dumb.pitch,
-	                    flags & WLD_DRM_FLAG_SCANOUT);
+	                    flags & WLD_DRM_FLAG_SCANOUT, true);
 
 	if (!buffer)
 		goto error1;
@@ -170,6 +201,9 @@ context_import_buffer(struct wld_context *base,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct dumb_context *context = dumb_context(base);
 	uint32_t handle;
 
@@ -182,7 +216,19 @@ context_import_buffer(struct wld_context *base,
 		return NULL;
 	}
 
-	return new_buffer(context, width, height, format, handle, pitch, false);
+	struct buffer *buffer = new_buffer(context, width, height, format, handle, pitch, false, false);
+	if (!buffer) {
+		/* An alias already owned by another wrapper is not ours to close. */
+		struct dumb_handle *reference;
+		for (reference = context->handles; reference; reference = reference->next)
+			if (reference->handle == handle)
+				break;
+		if (!reference) {
+			struct drm_gem_close close_arg = { .handle = handle };
+			drmIoctl(context->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+		}
+	}
+	return buffer;
 }
 
 void
@@ -209,7 +255,7 @@ buffer_map(struct buffer *base)
 		return false;
 	}
 
-	data = mmap(NULL, buffer->base.base.pitch * buffer->base.base.height,
+	data = mmap(NULL, (size_t)buffer->base.base.pitch * buffer->base.base.height,
 	            PROT_READ | PROT_WRITE, MAP_SHARED,
 	            buffer->context->fd, map_dumb.offset);
 
@@ -221,7 +267,7 @@ buffer_map(struct buffer *base)
 		buffer->base.base.map = calloc(buffer->base.base.height,
 		                               buffer->base.base.pitch);
 		if (!buffer->base.base.map) {
-			munmap(data, buffer->base.base.pitch * buffer->base.base.height);
+			munmap(data, (size_t)buffer->base.base.pitch * buffer->base.base.height);
 			buffer->scanout = NULL;
 			return false;
 		}
@@ -242,7 +288,11 @@ buffer_flush(struct buffer *base)
 	if (!buffer->shadowed || !buffer->scanout)
 		return;
 
-	boxes = pixman_region32_rectangles(&base->base.damage, &count);
+	pixman_region32_t damage;
+	pixman_region32_init(&damage);
+	pixman_region32_intersect_rect(&damage, &base->base.damage, 0, 0,
+	                               base->base.width, base->base.height);
+	boxes = pixman_region32_rectangles(&damage, &count);
 	while (count--) {
 		int32_t y;
 		size_t offset = (size_t)boxes->y1 * base->base.pitch +
@@ -256,6 +306,7 @@ buffer_flush(struct buffer *base)
 		}
 		++boxes;
 	}
+	pixman_region32_fini(&damage);
 }
 
 bool
@@ -264,7 +315,7 @@ buffer_unmap(struct buffer *buffer)
 	struct dumb_buffer *dumb = dumb_buffer(&buffer->base);
 
 	if (munmap(dumb->scanout,
-	           buffer->base.pitch * buffer->base.height)
+	           (size_t)buffer->base.pitch * buffer->base.height)
 	    == -1) {
 		return false;
 	}
@@ -281,10 +332,20 @@ void
 buffer_destroy(struct buffer *base)
 {
 	struct dumb_buffer *buffer = dumb_buffer(&base->base);
-	struct drm_mode_destroy_dumb destroy_dumb = {
-		.handle = buffer->handle
-	};
-
-	drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+	struct dumb_handle *reference = buffer->handle_ref;
+	if (--reference->references == 0) {
+		struct dumb_handle **link = &buffer->context->handles;
+		while (*link != reference)
+			link = &(*link)->next;
+		*link = reference->next;
+		if (reference->allocated) {
+			struct drm_mode_destroy_dumb destroy_dumb = {.handle = reference->handle};
+			drmIoctl(buffer->context->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_dumb);
+		} else {
+			struct drm_gem_close close_arg = {.handle = reference->handle};
+			drmIoctl(buffer->context->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+		}
+		free(reference);
+	}
 	free(buffer);
 }

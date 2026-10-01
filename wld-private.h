@@ -27,6 +27,11 @@
 #include "wld.h"
 
 #include <assert.h>
+#include <limits.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <ft2build.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -220,6 +225,10 @@ struct buffer_socket_impl {
 };
 
 bool font_ensure_glyph(struct font *font, FT_UInt glyph_index);
+void default_draw_text(struct wld_renderer *renderer, struct wld_context *context,
+                       struct font *font,
+                       uint32_t color, int32_t x, int32_t y, const char *text,
+                       uint32_t length, struct wld_extents *extents);
 
 /**
  * Returns the number of bytes per pixel for the given format.
@@ -235,6 +244,24 @@ format_bytes_per_pixel(enum wld_format format)
 		return 0;
 	}
 }
+/* All layouts must also fit the signed dimensions/stride used by pixman. */
+static inline bool
+buffer_dimensions_valid(uint32_t width, uint32_t height, uint32_t format)
+{
+	return width && height && format_bytes_per_pixel(format) &&
+	       width <= INT32_MAX / 4 && height <= INT32_MAX &&
+	       height <= SIZE_MAX / ((size_t)width * 4);
+}
+
+static inline bool
+buffer_layout_valid(uint32_t width, uint32_t height, uint32_t format,
+                    uint32_t pitch)
+{
+	return buffer_dimensions_valid(width, height, format) &&
+	       pitch >= (uint64_t)width * 4 && pitch <= INT32_MAX &&
+	       pitch % 4 == 0 && height <= SIZE_MAX / pitch;
+}
+
 /*
  * The pixman transform that maps the destination rectangle `dst` back onto
  * the source rectangle `src`, which is the direction pixman samples in.
@@ -249,18 +276,27 @@ format_bytes_per_pixel(enum wld_format format)
  * At scale 1 with an integral origin it reduces to a plain translation, so a
  * scaled blit that is not scaling anything still copies exactly.
  */
-static inline void
+static inline bool
 scaled_transform(pixman_transform_t *transform,
                  const struct wld_rect *dst, const struct wld_frect *src)
 {
 	double scale_x = src->width / (double)dst->width;
 	double scale_y = src->height / (double)dst->height;
 
+	double offset_x = src->x + scale_x / 2 - 0.5;
+	double offset_y = src->y + scale_y / 2 - 0.5;
+	if (!isfinite(scale_x) || !isfinite(scale_y) ||
+	    !isfinite(offset_x) || !isfinite(offset_y) ||
+	    scale_x <= 0 || scale_y <= 0 || scale_x >= 32768 || scale_y >= 32768 ||
+	    offset_x < -32768 || offset_x >= 32768 || offset_y < -32768 || offset_y >= 32768)
+		return false;
+
 	pixman_transform_init_identity(transform);
 	transform->matrix[0][0] = pixman_double_to_fixed(scale_x);
 	transform->matrix[1][1] = pixman_double_to_fixed(scale_y);
-	transform->matrix[0][2] = pixman_double_to_fixed(src->x + scale_x / 2 - 0.5);
-	transform->matrix[1][2] = pixman_double_to_fixed(src->y + scale_y / 2 - 0.5);
+	transform->matrix[0][2] = pixman_double_to_fixed(offset_x);
+	transform->matrix[1][2] = pixman_double_to_fixed(offset_y);
+	return true;
 }
 
 

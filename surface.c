@@ -48,7 +48,8 @@ EXPORT
 struct wld_buffer *
 wld_surface_take(struct wld_surface *surface)
 {
-	return &surface->impl->take(surface)->base;
+	struct buffer *buffer = surface->impl->take(surface);
+	return buffer ? &buffer->base : NULL;
 }
 
 EXPORT

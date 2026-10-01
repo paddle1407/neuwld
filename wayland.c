@@ -298,6 +298,7 @@ buffer_socket_attach(struct buffer_socket *base, struct buffer *buffer)
 		while (num_boxes--) {
 			wl_surface_damage(socket->wl, box->x1, box->y1,
 			                  box->x2 - box->x1, box->y2 - box->y1);
+			++box;
 		}
 	}
 

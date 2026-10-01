@@ -45,6 +45,8 @@ struct pixman_renderer {
 	 * for drawing whose extent is not worth working out.
 	 */
 	struct buffer *target_buffer;
+	pixman_region32_t clip;
+	bool clip_enabled;
 	pixman_region32_t damage;
 	bool damage_all;
 };
@@ -89,6 +91,8 @@ context_create_renderer(struct wld_context *context)
 	renderer->target = NULL;
 	renderer->target_buffer = NULL;
 	pixman_region32_init(&renderer->damage);
+	pixman_region32_init(&renderer->clip);
+	renderer->clip_enabled = false;
 	renderer->damage_all = false;
 
 	return &renderer->base;
@@ -123,6 +127,9 @@ context_create_buffer(struct wld_context *context,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t flags)
 {
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
+
 	struct buffer *buffer;
 	pixman_image_t *image;
 
@@ -149,6 +156,9 @@ context_import_buffer(struct wld_context *context,
                       uint32_t width, uint32_t height,
                       uint32_t format, uint32_t pitch)
 {
+	if (!buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+
 	struct buffer *buffer;
 	pixman_image_t *image;
 
@@ -269,6 +279,10 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 {
 	struct pixman_renderer *renderer = pixman_renderer(base);
 
+	pixman_image_t *image = buffer ? pixman_image(buffer) : NULL;
+	if (buffer && !image)
+		return false;
+
 	if (renderer->target) {
 		/* The image is the buffer's own, so a clip left on it would
 		 * confine whoever draws into that buffer next. */
@@ -279,14 +293,9 @@ renderer_set_target(struct wld_renderer *base, struct buffer *buffer)
 	pixman_region32_clear(&renderer->damage);
 	renderer->damage_all = false;
 	renderer->target_buffer = buffer;
-
-	if (buffer) {
-		if (!(renderer->target = pixman_image(buffer)))
-			renderer->target_buffer = NULL;
-		return renderer->target;
-	}
-
-	renderer->target = NULL;
+	renderer->target = image;
+	renderer->clip_enabled = false;
+	pixman_region32_clear(&renderer->clip);
 	return true;
 }
 
@@ -298,13 +307,16 @@ renderer_set_clip(struct wld_renderer *base, const pixman_box32_t *box)
 
 	if (!renderer->target)
 		return;
+	renderer->clip_enabled = box != NULL;
 	if (!box) {
+		pixman_region32_clear(&renderer->clip);
 		pixman_image_set_clip_region32(renderer->target, NULL);
 		return;
 	}
 	pixman_region32_init_rect(&region, box->x1, box->y1,
-	                          box->x2 > box->x1 ? box->x2 - box->x1 : 0,
-	                          box->y2 > box->y1 ? box->y2 - box->y1 : 0);
+	                          (uint32_t)((int64_t)box->x2 - box->x1),
+	                          (uint32_t)((int64_t)box->y2 - box->y1));
+	pixman_region32_copy(&renderer->clip, &region);
 	pixman_image_set_clip_region32(renderer->target, &region);
 	pixman_region32_fini(&region);
 }
@@ -379,6 +391,8 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
 	pixman_region32_init(&clip);
 	pixman_region32_copy(&clip, region);
 	pixman_region32_translate(&clip, dst_x, dst_y);
+	if (renderer->clip_enabled)
+		pixman_region32_intersect(&clip, &clip, &renderer->clip);
 
 	pixman_image_set_clip_region32(dst, &clip);
 	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, dst,
@@ -388,7 +402,8 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
 	                         region->extents.x2 - region->extents.x1,
 	                         region->extents.y2 - region->extents.y1);
 	pixman_image_unref(src);
-	pixman_image_set_clip_region32(dst, NULL);
+	pixman_image_set_clip_region32(dst, renderer->clip_enabled
+	                                      ? &renderer->clip : NULL);
 
 	pixman_region32_union(&renderer->damage, &renderer->damage, &clip);
 	pixman_region32_fini(&clip);
@@ -405,7 +420,10 @@ renderer_blend_scaled(struct wld_renderer *base, struct buffer *buffer,
 	if (!source)
 		return;
 
-	scaled_transform(&transform, dst, src);
+	if (!scaled_transform(&transform, dst, src)) {
+		pixman_image_unref(source);
+		return;
+	}
 	pixman_image_set_transform(source, &transform);
 	pixman_image_set_filter(source, PIXMAN_FILTER_BILINEAR, NULL, 0);
 	/*
@@ -448,7 +466,7 @@ glyph_bitmap_to_pixman_image(struct glyph *glyph)
 	switch (bitmap->pixel_mode) {
 	case FT_PIXEL_MODE_MONO:
 		image = pixman_image_create_bits(PIXMAN_a1, bitmap->width,
-		                                 bitmap->rows, NULL, bitmap->pitch);
+		                                 bitmap->rows, NULL, 0);
 		if (!image)
 			return NULL;
 
@@ -507,7 +525,9 @@ renderer_draw_text(struct wld_renderer *base,
 
 	if (length == -1)
 		length = strlen(text);
-	glyphs = malloc(length * sizeof(glyphs[0]));
+	if (length > SIZE_MAX / sizeof(glyphs[0]))
+		return;
+	glyphs = malloc((size_t)length * sizeof(glyphs[0]));
 	if (!glyphs)
 		return;
 	solid = pixman_image_create_solid_fill(&pixman_color);
@@ -516,6 +536,7 @@ renderer_draw_text(struct wld_renderer *base,
 		return;
 	}
 
+	pixman_glyph_cache_freeze(renderer->glyph_cache);
 	while ((ret = FcUtf8ToUcs4((FcChar8 *)text, &c, length)) > 0 && c != '\0') {
 		text += ret;
 		length -= ret;
@@ -545,16 +566,15 @@ renderer_draw_text(struct wld_renderer *base,
 				goto advance;
 
 			/* Insert the glyph into the cache. */
-			pixman_glyph_cache_freeze(renderer->glyph_cache);
 			glyphs[index].glyph = pixman_glyph_cache_insert(renderer->glyph_cache, font_key, glyph_key,
 			                                                -glyph->x, -glyph->y, image);
-			pixman_glyph_cache_thaw(renderer->glyph_cache);
 
 			/* The glyph cache copies the contents of the glyph bitmap. */
 			pixman_image_unref(image);
 		}
 
-		++index;
+		if (glyphs[index].glyph)
+			++index;
 
 	advance:
 		origin_x += glyph->advance;
@@ -563,6 +583,7 @@ renderer_draw_text(struct wld_renderer *base,
 	pixman_composite_glyphs_no_mask(PIXMAN_OP_OVER, solid, renderer->target,
 	                                0, 0, x, y, renderer->glyph_cache,
 	                                index, glyphs);
+	pixman_glyph_cache_thaw(renderer->glyph_cache);
 	/* Glyph extents reach above and below the baseline; not worth tracking. */
 	renderer->damage_all = true;
 
@@ -595,7 +616,9 @@ renderer_destroy(struct wld_renderer *base)
 {
 	struct pixman_renderer *renderer = pixman_renderer(base);
 
+	renderer_set_target(base, NULL);
 	pixman_glyph_cache_destroy(renderer->glyph_cache);
+	pixman_region32_fini(&renderer->clip);
 	pixman_region32_fini(&renderer->damage);
 	free(renderer);
 }

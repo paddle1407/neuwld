@@ -23,6 +23,9 @@
 
 #include "wld-private.h"
 
+#include <math.h>
+#include "pixman.h"
+
 void
 default_fill_region(struct wld_renderer *renderer, uint32_t color, pixman_region32_t *region)
 {
@@ -32,8 +35,8 @@ default_fill_region(struct wld_renderer *renderer, uint32_t color, pixman_region
 	box = pixman_region32_rectangles(region, &num_boxes);
 
 	while (num_boxes--) {
-		renderer->impl->fill_rectangle(renderer, color, box->x1, box->y1,
-		                               box->x2 - box->x1, box->y2 - box->y1);
+		wld_fill_rectangle(renderer, color, box->x1, box->y1,
+		                   box->x2 - box->x1, box->y2 - box->y1);
 		++box;
 	}
 }
@@ -49,10 +52,16 @@ default_copy_region(struct wld_renderer *renderer, struct buffer *buffer,
 	box = pixman_region32_rectangles(region, &num_boxes);
 
 	while (num_boxes--) {
-		renderer->impl->copy_rectangle(renderer, buffer,
-		                               dst_x + box->x1, dst_y + box->y1,
-		                               box->x1, box->y1,
-		                               box->x2 - box->x1, box->y2 - box->y1);
+		int64_t x = (int64_t)dst_x + box->x1;
+		int64_t y = (int64_t)dst_y + box->y1;
+		if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX) {
+			++box;
+			continue;
+		}
+		wld_copy_rectangle(renderer, &buffer->base,
+		                   x, y,
+		                   box->x1, box->y1,
+		                   box->x2 - box->x1, box->y2 - box->y1);
 		++box;
 	}
 }
@@ -62,12 +71,14 @@ renderer_initialize(struct wld_renderer *renderer, const struct wld_renderer_imp
 {
 	*((const struct wld_renderer_impl **)&renderer->impl) = impl;
 	renderer->target = NULL;
+	renderer->clip_enabled = false;
 }
 
 EXPORT
 void
 wld_destroy_renderer(struct wld_renderer *renderer)
 {
+	wld_flush(renderer);
 	renderer->impl->destroy(renderer);
 }
 
@@ -75,7 +86,7 @@ EXPORT
 uint32_t
 wld_capabilities(struct wld_renderer *renderer, struct wld_buffer *buffer)
 {
-	return renderer->impl->capabilities(renderer, (struct buffer *)buffer);
+	return buffer ? renderer->impl->capabilities(renderer, (struct buffer *)buffer) : 0;
 }
 
 EXPORT
@@ -103,10 +114,19 @@ EXPORT
 bool
 wld_set_target_buffer(struct wld_renderer *renderer, struct wld_buffer *buffer)
 {
-	if (!renderer->impl->set_target(renderer, (struct buffer *)buffer))
+	struct wld_buffer *old_target = renderer->target;
+	if (buffer)
+		wld_buffer_reference(buffer);
+	if (!renderer->impl->set_target(renderer, (struct buffer *)buffer)) {
+		if (buffer)
+			wld_buffer_unreference(buffer);
 		return false;
+	}
 
 	renderer->target = buffer;
+	if (old_target)
+		wld_buffer_unreference(old_target);
+	renderer->clip_enabled = false;
 
 	return true;
 }
@@ -115,8 +135,14 @@ EXPORT
 void
 wld_set_clip(struct wld_renderer *renderer, const pixman_box32_t *box)
 {
+	renderer->clip_enabled = box != NULL;
+	if (box) {
+		renderer->clip = *box;
+		if (box->x2 < box->x1) renderer->clip.x2 = box->x1;
+		if (box->y2 < box->y1) renderer->clip.y2 = box->y1;
+	}
 	if (renderer->impl->set_clip)
-		renderer->impl->set_clip(renderer, box);
+		renderer->impl->set_clip(renderer, box ? &renderer->clip : NULL);
 }
 
 EXPORT
@@ -128,10 +154,30 @@ wld_set_target_surface(struct wld_renderer *renderer, struct wld_surface *surfac
 	if (!(back_buffer = surface->impl->back(surface)))
 		return false;
 
-	if (!renderer->impl->set_target(renderer, back_buffer))
-		return false;
+	return wld_set_target_buffer(renderer, &back_buffer->base);
+}
 
-	renderer->target = &back_buffer->base;
+/* Clip before narrowing backend coordinates or submitting hardware commands. */
+static bool
+clip_rectangle(struct wld_renderer *renderer, int32_t *x, int32_t *y,
+               uint32_t *width, uint32_t *height)
+{
+	if (!renderer->target || !*width || !*height)
+		return false;
+	int64_t x1 = *x, y1 = *y, x2 = x1 + *width, y2 = y1 + *height;
+	if (x1 < 0) x1 = 0;
+	if (y1 < 0) y1 = 0;
+	if (x2 > renderer->target->width) x2 = renderer->target->width;
+	if (y2 > renderer->target->height) y2 = renderer->target->height;
+	if (renderer->clip_enabled) {
+		if (x1 < renderer->clip.x1) x1 = renderer->clip.x1;
+		if (y1 < renderer->clip.y1) y1 = renderer->clip.y1;
+		if (x2 > renderer->clip.x2) x2 = renderer->clip.x2;
+		if (y2 > renderer->clip.y2) y2 = renderer->clip.y2;
+	}
+	if (x2 <= x1 || y2 <= y1)
+		return false;
+	*x = x1; *y = y1; *width = x2 - x1; *height = y2 - y1;
 	return true;
 }
 
@@ -140,14 +186,16 @@ void
 wld_fill_rectangle(struct wld_renderer *renderer, uint32_t color,
                    int32_t x, int32_t y, uint32_t width, uint32_t height)
 {
-	renderer->impl->fill_rectangle(renderer, color, x, y, width, height);
+	if (clip_rectangle(renderer, &x, &y, &width, &height))
+		renderer->impl->fill_rectangle(renderer, color, x, y, width, height);
 }
 
 EXPORT
 void
 wld_fill_region(struct wld_renderer *renderer, uint32_t color, pixman_region32_t *region)
 {
-	renderer->impl->fill_region(renderer, color, region);
+	if (renderer->target && region)
+		renderer->impl->fill_region(renderer, color, region);
 }
 
 EXPORT
@@ -158,8 +206,25 @@ wld_copy_rectangle(struct wld_renderer *renderer,
                    int32_t src_x, int32_t src_y,
                    uint32_t width, uint32_t height)
 {
+	int32_t old_x = dst_x, old_y = dst_y;
+	if (!buffer || !clip_rectangle(renderer, &dst_x, &dst_y, &width, &height))
+		return;
+	int64_t sx = (int64_t)src_x + dst_x - old_x;
+	int64_t sy = (int64_t)src_y + dst_y - old_y;
+	if (sx < 0) {
+		if (-sx >= width) return;
+		dst_x -= sx; width += sx; sx = 0;
+	}
+	if (sy < 0) {
+		if (-sy >= height) return;
+		dst_y -= sy; height += sy; sy = 0;
+	}
+	if (sx >= buffer->width || sy >= buffer->height)
+		return;
+	if (width > buffer->width - sx) width = buffer->width - sx;
+	if (height > buffer->height - sy) height = buffer->height - sy;
 	renderer->impl->copy_rectangle(renderer, (struct buffer *)buffer,
-	                               dst_x, dst_y, src_x, src_y, width, height);
+	                               dst_x, dst_y, sx, sy, width, height);
 }
 
 EXPORT
@@ -168,6 +233,8 @@ wld_copy_region(struct wld_renderer *renderer,
                 struct wld_buffer *buffer,
                 int32_t dst_x, int32_t dst_y, pixman_region32_t *region)
 {
+	if (!renderer->target || !buffer || !region)
+		return;
 	renderer->impl->copy_region(renderer, (struct buffer *)buffer,
 	                            dst_x, dst_y, region);
 }
@@ -181,7 +248,7 @@ wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	pixman_region32_t clip;
 	pixman_box32_t *extents;
 
-	if (!renderer->target || !pixman_region32_not_empty(region))
+	if (!renderer->target || !buffer || !region || !pixman_region32_not_empty(region))
 		return;
 
 	/* An accelerated backend blends on the GPU and skips the readback below. */
@@ -212,6 +279,14 @@ wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	pixman_region32_init(&clip);
 	pixman_region32_copy(&clip, region);
 	pixman_region32_translate(&clip, dst_x, dst_y);
+	pixman_region32_intersect_rect(&clip, &clip, 0, 0,
+	                               renderer->target->width, renderer->target->height);
+	if (renderer->clip_enabled) {
+		pixman_region32_t confinement;
+		pixman_region32_init_with_extents(&confinement, &renderer->clip);
+		pixman_region32_intersect(&clip, &clip, &confinement);
+		pixman_region32_fini(&confinement);
+	}
 	extents = pixman_region32_extents(region);
 	pixman_image_set_clip_region32(dst, &clip);
 	pixman_image_composite32(PIXMAN_OP_OVER, src, NULL, dst,
@@ -243,10 +318,12 @@ wld_blend_scaled(struct wld_renderer *renderer, struct wld_buffer *buffer,
 {
 	pixman_image_t *source = NULL, *target = NULL;
 	pixman_transform_t transform;
+	pixman_region32_t damage;
 
-	if (!renderer->target || dst->width == 0 || dst->height == 0)
+	if (!renderer->target || !buffer || !dst || !src || dst->width == 0 || dst->height == 0)
 		return;
-	if (src->width <= 0.0 || src->height <= 0.0)
+	if (!isfinite(src->x) || !isfinite(src->y) || !isfinite(src->width) ||
+	    !isfinite(src->height) || src->width <= 0.0 || src->height <= 0.0)
 		return;
 
 	/* An accelerated backend scales on the GPU and skips the readback below. */
@@ -273,7 +350,18 @@ wld_blend_scaled(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	if (!source || !target)
 		goto destroy_images;
 
-	scaled_transform(&transform, dst, src);
+	if (!scaled_transform(&transform, dst, src))
+		goto destroy_images;
+	pixman_region32_init_rect(&damage, dst->x, dst->y, dst->width, dst->height);
+	pixman_region32_intersect_rect(&damage, &damage, 0, 0,
+	                               renderer->target->width, renderer->target->height);
+	if (renderer->clip_enabled) {
+		pixman_region32_t confinement;
+		pixman_region32_init_with_extents(&confinement, &renderer->clip);
+		pixman_region32_intersect(&damage, &damage, &confinement);
+		pixman_region32_fini(&confinement);
+	}
+	pixman_image_set_clip_region32(target, &damage);
 	pixman_image_set_transform(source, &transform);
 	pixman_image_set_filter(source, PIXMAN_FILTER_BILINEAR, NULL, 0);
 	/*
@@ -283,6 +371,9 @@ wld_blend_scaled(struct wld_renderer *renderer, struct wld_buffer *buffer,
 	pixman_image_composite32(PIXMAN_OP_OVER, source, NULL, target,
 	                         0, 0, 0, 0, dst->x, dst->y,
 	                         dst->width, dst->height);
+	if (renderer->target->impl->damage)
+		renderer->target->impl->damage((struct buffer *)renderer->target, &damage);
+	pixman_region32_fini(&damage);
 
 destroy_images:
 	if (source)
@@ -302,21 +393,21 @@ circle_points(struct wld_renderer *renderer, uint32_t color,
 {
 	/* hacky */
 	if (fill) {
-		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1+y2, 2*x2 + 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1-y2, 2*x2 + 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1+x2, 2*y2 + 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1-x2, 2*y2 + 1, 1);
+		wld_fill_rectangle(renderer, color, x1-x2, y1+y2, 2*x2 + 1, 1);
+		wld_fill_rectangle(renderer, color, x1-x2, y1-y2, 2*x2 + 1, 1);
+		wld_fill_rectangle(renderer, color, x1-y2, y1+x2, 2*y2 + 1, 1);
+		wld_fill_rectangle(renderer, color, x1-y2, y1-x2, 2*y2 + 1, 1);
 	}
 	
 	else {
-		renderer->impl->fill_rectangle(renderer, color, x1+x2, y1+y2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1+y2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1+x2, y1-y2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-x2, y1-y2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1+y2, y1+x2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1+x2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1+y2, y1-x2, 1, 1);
-		renderer->impl->fill_rectangle(renderer, color, x1-y2, y1-x2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1+x2, y1+y2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1-x2, y1+y2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1+x2, y1-y2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1-x2, y1-y2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1+y2, y1+x2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1-y2, y1+x2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1+y2, y1-x2, 1, 1);
+		wld_fill_rectangle(renderer, color, x1-y2, y1-x2, 1, 1);
 	}
 }
 
@@ -325,6 +416,10 @@ void
 wld_draw_circle(struct wld_renderer *renderer, uint32_t color, 
 				int32_t x, int32_t y, uint32_t r, bool fill)
 {
+	if (r > INT32_MAX / 8 || (int64_t)x - r < INT32_MIN ||
+	    (int64_t)x + r > INT32_MAX || (int64_t)y - r < INT32_MIN ||
+	    (int64_t)y + r > INT32_MAX)
+		return;
 	int32_t x1 = 0, y1 = r;
 	int32_t d = 3 - 2 * r;
 	circle_points(renderer, color, x, y, x1, y1, fill);
@@ -348,12 +443,12 @@ void
 wld_draw_line(struct wld_renderer *renderer, uint32_t color,
 			 int32_t x1, int32_t y1, int32_t x2, int32_t y2)
 {
-	int32_t dx = abs(x2-x1),  sx = x1<x2 ? 1 : -1;
-	int32_t dy = -abs(y2-y1), sy = y1<y2 ? 1 : -1;
-	int32_t err = dx+dy, e2;
+	int64_t dx = llabs((int64_t)x2 - x1), dy = -llabs((int64_t)y2 - y1);
+	int32_t sx = x1 < x2 ? 1 : -1, sy = y1 < y2 ? 1 : -1;
+	int64_t err = dx + dy, e2;
 
 	while(true) {
-		renderer->impl->fill_rectangle(renderer, color, x1, y1, 1, 1);
+		wld_fill_rectangle(renderer, color, x1, y1, 1, 1);
 
 		if (x1==x2 && y1==y2)
 			break;
@@ -372,6 +467,61 @@ wld_draw_line(struct wld_renderer *renderer, uint32_t color,
 	}
 }
 
+void
+default_draw_text(struct wld_renderer *renderer, struct wld_context *context,
+                  struct font *font, uint32_t color, int32_t x, int32_t y,
+                  const char *text, uint32_t length, struct wld_extents *extents)
+{
+	struct wld_buffer *target = renderer->target, *staging = NULL;
+	struct wld_renderer *copy = NULL;
+	if (!target)
+		return;
+	/* Submit the target's earlier writes before mapping it or copying them. */
+	renderer->impl->flush(renderer);
+	struct wld_renderer *cpu = wld_create_renderer(wld_pixman_context);
+	if (!cpu)
+		return;
+	if (!wld_set_target_buffer(cpu, target)) {
+		/* A tiled target cannot be mapped linearly. Preserve its background
+		 * in a mapped buffer belonging to the same hardware context, then
+		 * blend on the CPU and copy the resulting pixels back, without
+		 * introducing a cross-backend source or applying alpha twice. */
+		if (!context)
+			goto done;
+		staging = wld_create_buffer(context, target->width, target->height,
+		                            target->format, WLD_FLAG_MAP);
+		copy = wld_create_renderer(context);
+		if (!staging || !copy ||
+		    !(wld_capabilities(copy, target) & WLD_CAPABILITY_READ) ||
+		    !(wld_capabilities(copy, staging) & WLD_CAPABILITY_WRITE) ||
+		    !(wld_capabilities(renderer, staging) & WLD_CAPABILITY_READ) ||
+		    !wld_set_target_buffer(copy, staging))
+			goto done;
+		wld_copy_rectangle(copy, target, 0, 0, 0, 0,
+		                   target->width, target->height);
+		wld_flush(copy);
+		if (!wld_set_target_buffer(cpu, staging))
+			goto done;
+	}
+	if (renderer->clip_enabled)
+		wld_set_clip(cpu, &renderer->clip);
+	wld_draw_text(cpu, &font->base, color, x, y, text, length, extents);
+	wld_flush(cpu);
+	if (staging) {
+		/* The rectangle wrapper retains the original target confinement. */
+		wld_copy_rectangle(renderer, staging, 0, 0, 0, 0,
+		                   target->width, target->height);
+		/* Kernel/driver references must cover staging until this submission. */
+		renderer->impl->flush(renderer);
+	}
+done:
+	wld_destroy_renderer(cpu);
+	if (copy)
+		wld_destroy_renderer(copy);
+	if (staging)
+		wld_buffer_unreference(staging);
+}
+
 EXPORT
 void
 wld_draw_text(struct wld_renderer *renderer,
@@ -380,6 +530,10 @@ wld_draw_text(struct wld_renderer *renderer,
               struct wld_extents *extents)
 {
 	struct font *font = (void *)font_base;
+	if (extents)
+		extents->advance = 0;
+	if (!renderer->target || !font || !text)
+		return;
 
 	renderer->impl->draw_text(renderer, font, color, x, y, text, length,
 	                          extents);
@@ -405,6 +559,5 @@ wld_flush(struct wld_renderer *renderer)
 	if (renderer->target && ((struct buffer *)renderer->target)->base.impl->flush)
 		((struct buffer *)renderer->target)->base.impl->flush(
 		    (struct buffer *)renderer->target);
-	renderer->impl->set_target(renderer, NULL);
-	renderer->target = NULL;
+	wld_set_target_buffer(renderer, NULL);
 }

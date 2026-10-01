@@ -42,9 +42,11 @@ wld_create_buffer(struct wld_context *context,
                   uint32_t width, uint32_t height,
                   uint32_t format, uint32_t flags)
 {
-	return &context->impl->create_buffer(context, width, height,
-	                                     format, flags)
-	            ->base;
+	if (!context || !buffer_dimensions_valid(width, height, format))
+		return NULL;
+	struct buffer *buffer = context->impl->create_buffer(context, width, height,
+	                                                    format, flags);
+	return buffer ? &buffer->base : NULL;
 }
 
 EXPORT
@@ -54,9 +56,11 @@ wld_import_buffer(struct wld_context *context,
                   uint32_t width, uint32_t height,
                   uint32_t format, uint32_t pitch)
 {
-	return &context->impl->import_buffer(context, type, object,
-	                                     width, height, format, pitch)
-	            ->base;
+	if (!context || !buffer_layout_valid(width, height, format, pitch))
+		return NULL;
+	struct buffer *buffer = context->impl->import_buffer(context, type, object,
+	                                                    width, height, format, pitch);
+	return buffer ? &buffer->base : NULL;
 }
 
 EXPORT
@@ -65,6 +69,8 @@ wld_create_surface(struct wld_context *context,
                    uint32_t width, uint32_t height,
                    uint32_t format, uint32_t flags)
 {
+	if (!context || !buffer_dimensions_valid(width, height, format))
+		return NULL;
 	return context->impl->create_surface(context, width, height, format, flags);
 }
 

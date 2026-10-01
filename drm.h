@@ -48,6 +48,8 @@ enum wld_drm_object_type {
 	 * cannot be imported correctly without.
 	 */
 	WLD_DRM_OBJECT_DMABUF,
+	/** object.ptr receives a borrowed const struct wld_drm_layout *. */
+	WLD_DRM_OBJECT_LAYOUT,
 };
 
 struct wld_dmabuf_attributes {
@@ -55,6 +57,13 @@ struct wld_dmabuf_attributes {
 	uint32_t offset;
 	uint32_t pitch;
 	uint64_t modifier;
+};
+
+/* Complete KMS layout. Borrowed exports remain valid while the buffer lives. */
+struct wld_drm_layout {
+	uint32_t num_planes;
+	uint32_t handles[4], pitches[4], offsets[4];
+	uint64_t modifiers[4];
 };
 
 enum wld_drm_flags {

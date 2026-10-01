@@ -31,9 +31,10 @@ WLD_SOURCES= \
     context.c \
     font.c \
     renderer.c \
-    surface.c
+    surface.c \
+    pixman.c
 
-WLD_HEADERS=wld.h
+WLD_HEADERS=wld.h pixman.h
 
 .if ${ENABLE_DRM} == 1
 WLD_REQUIRES_PRIVATE+=libdrm
@@ -51,11 +52,6 @@ WLD_REQUIRES_PRIVATE+=libdrm_nouveau
 WLD_SOURCES+=nouveau.c
 WLD_CPPFLAGS+=-DWITH_DRM_NOUVEAU=1
 .endif
-.endif
-
-.if ${ENABLE_PIXMAN} == 1
-WLD_SOURCES+=pixman.c
-WLD_HEADERS+=pixman.h
 .endif
 
 .if ${ENABLE_WAYLAND} == 1

@@ -1,6 +1,6 @@
 project('wld', 'c',
   version: '0.0',
-  meson_version: '>=1.1',
+  meson_version: '>=1.8.0',
   license: 'MIT',
   default_options: [
     # C11: libdrm uses anonymous union extension

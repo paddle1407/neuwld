@@ -109,7 +109,9 @@ wld_font_open_pattern(struct wld_font_context *context, FcPattern *match)
 
 		DEBUG("Loading font file: %s\n", filename);
 
-		error = FT_New_Face(context->library, filename, 0, &font->face);
+		int face_index = 0;
+		FcPatternGetInteger(match, FC_INDEX, 0, &face_index);
+		error = FT_New_Face(context->library, filename, face_index, &font->face);
 
 		if (error == 0)
 			goto load_face;
@@ -137,8 +139,8 @@ load_face:
 	if (font->face->face_flags & FT_FACE_FLAG_SCALABLE) {
 		FT_F26Dot6 width, height;
 
-		width = ((unsigned int)pixel_size) << 6;
-		height = ((unsigned int)(pixel_size * aspect)) << 6;
+		width = (FT_F26Dot6)(pixel_size * 64);
+		height = (FT_F26Dot6)(pixel_size * aspect * 64);
 
 		if (FT_Set_Char_Size(font->face, width, height, 0, 0) != 0) goto error_face;
 	} else {

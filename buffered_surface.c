@@ -51,6 +51,9 @@ buffered_surface_create(struct wld_context *context, uint32_t width, uint32_t he
 {
 	struct buffered_surface *surface;
 
+	if (!buffer_dimensions_valid(width, height, format))
+		return NULL;
+
 	if (!(surface = malloc(sizeof *surface)))
 		return NULL;
 
@@ -121,7 +124,11 @@ surface_back(struct wld_surface *base)
 
 	if (surface->entries_size == surface->entries_capacity) {
 		struct buffer_entry *new_entries;
-		size_t new_capacity = surface->entries_capacity * 2 + 1;
+		if (surface->entries_capacity > (UINT_MAX - 1) / 2)
+			goto error1;
+		size_t new_capacity = (size_t)surface->entries_capacity * 2 + 1;
+		if (new_capacity > SIZE_MAX / sizeof surface->entries[0])
+			goto error1;
 
 		new_entries = realloc(surface->entries,
 		                      new_capacity * sizeof surface->entries[0]);

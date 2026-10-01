@@ -126,8 +126,9 @@ wayland_create_context(struct wl_display *display,
 	return &context->base;
 
 error4:
-	close(context->fd);
 error3:
+	if (context->fd >= 0)
+		close(context->fd);
 	wl_drm_destroy(context->wl);
 error2:
 	wl_registry_destroy(context->registry);
@@ -260,7 +261,7 @@ drm_device(void *data, struct wl_drm *wl, const char *name)
 		/* Keep the device already opened; overwriting would leak its fd. */
 		return;
 	}
-	fd = open(name, O_RDWR);
+	fd = open(name, O_RDWR | O_CLOEXEC);
 	if (fd == -1) {
 		DEBUG("Couldn't open DRM device '%s'\n", name);
 		return;

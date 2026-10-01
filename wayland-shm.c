@@ -178,7 +178,11 @@ context_create_buffer(struct wld_context *base,
 	struct shm_buffer *buffer;
 	char name[] = "/tmp/wld-XXXXXX";
 	uint32_t pitch = width * format_bytes_per_pixel(format);
-	size_t size = pitch * height;
+	size_t size;
+	if (!buffer_layout_valid(width, height, format, pitch) ||
+	    (uint64_t)pitch * height > INT32_MAX)
+		return NULL;
+	size = (size_t)pitch * height;
 	int fd;
 	struct wl_shm_pool *pool;
 	struct wl_buffer *wl;
@@ -264,7 +268,7 @@ buffer_map(struct buffer *base)
 	struct shm_buffer *buffer = shm_buffer(&base->base);
 	void *data;
 
-	data = mmap(NULL, buffer->base.base.pitch * buffer->base.base.height,
+	data = mmap(NULL, (size_t)buffer->base.base.pitch * buffer->base.base.height,
 	            PROT_READ | PROT_WRITE, MAP_SHARED, buffer->fd, 0);
 
 	if (data == MAP_FAILED)
@@ -279,7 +283,7 @@ bool
 buffer_unmap(struct buffer *buffer)
 {
 	if (munmap(buffer->base.map,
-	           buffer->base.pitch * buffer->base.height)
+	           (size_t)buffer->base.pitch * buffer->base.height)
 	    == -1) {
 		return false;
 	}
