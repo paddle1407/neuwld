@@ -25,6 +25,10 @@
 #error "You must define DRM_DRIVER_NAME before including interface/drm.h"
 #endif
 
+#ifndef DRM_DRIVER_REQUIRES_PCI
+#define DRM_DRIVER_REQUIRES_PCI false
+#endif
+
 /* DRM driver */
 static bool driver_device_supported(uint32_t vendor_id, uint32_t device_id);
 static struct wld_context *driver_create_context(int drm_fd);
@@ -34,9 +38,11 @@ static struct wld_context *driver_create_context(int drm_fd);
 #define STRING(name) #name
 const struct drm_driver EXPAND(VAR, DRM_DRIVER_NAME) = {
 	.name = EXPAND(STRING, DRM_DRIVER_NAME),
+	.requires_pci = DRM_DRIVER_REQUIRES_PCI,
 	.device_supported = &driver_device_supported,
 	.create_context = &driver_create_context,
 };
 #undef VAR
 #undef STRING
 #undef EXPAND
+#undef DRM_DRIVER_REQUIRES_PCI

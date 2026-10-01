@@ -150,6 +150,16 @@ pkg.generate(
   requires_private: requires_private,
 )
 
+if drm.found()
+  drm_dispatch_test = executable('drm_dispatch_test', 'test/drm_dispatch_test.c',
+    dependencies: requires + requires_private,
+    c_args: ['-D_POSIX_C_SOURCE=200809L'],
+    implicit_include_directories: false,
+    override_options: ['b_ndebug=false'],
+  )
+  test('drm_dispatch', drm_dispatch_test, timeout: 10)
+endif
+
 doxygen = find_program('doxygen', required: get_option('doxygen'))
 if doxygen.found()
   run_target('doxygen', command: [doxygen])

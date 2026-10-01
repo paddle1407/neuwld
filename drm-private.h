@@ -28,6 +28,7 @@
 
 struct drm_driver {
 	const char *name;
+	bool requires_pci;
 	bool (*device_supported)(uint32_t vendor_id, uint32_t device_id);
 	struct wld_context *(*create_context)(int drm_fd);
 };

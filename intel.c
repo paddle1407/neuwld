@@ -54,6 +54,7 @@ struct intel_buffer {
 #include "interface/context.h"
 #include "interface/renderer.h"
 #define DRM_DRIVER_NAME intel
+#define DRM_DRIVER_REQUIRES_PCI true
 #include "interface/drm.h"
 IMPL(intel_context, wld_context)
 IMPL(intel_renderer, wld_renderer)

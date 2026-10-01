@@ -107,21 +107,22 @@ static struct wld_context *
 create_driver_context(int fd)
 {
 	drmDevicePtr device = NULL;
-	uint32_t vendor_id, device_id;
+	uint32_t vendor_id = 0, device_id = 0;
+	bool has_pci;
 	struct wld_context *context = NULL;
 	uint32_t index;
 
-	if (drmGetDevice2(fd, 0, &device) != 0)
-		return NULL;
-
-	if (device->bustype != DRM_BUS_PCI || !device->deviceinfo.pci)
-		goto out;
-
-	vendor_id = device->deviceinfo.pci->vendor_id;
-	device_id = device->deviceinfo.pci->device_id;
+	has_pci = drmGetDevice2(fd, 0, &device) == 0 && device &&
+	          device->bustype == DRM_BUS_PCI && device->deviceinfo.pci;
+	if (has_pci) {
+		vendor_id = device->deviceinfo.pci->vendor_id;
+		device_id = device->deviceinfo.pci->device_id;
+	}
 
 	for (index = 0; index < ARRAY_LENGTH(drivers); ++index) {
 		if (!driver_selected(drivers[index]->name))
+			continue;
+		if (drivers[index]->requires_pci && !has_pci)
 			continue;
 
 		if (!drivers[index]->device_supported(vendor_id, device_id))
@@ -137,7 +138,6 @@ create_driver_context(int fd)
 		      drivers[index]->name);
 	}
 
-out:
 	drmFreeDevice(&device);
 	return context;
 }

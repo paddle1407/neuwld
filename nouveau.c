@@ -72,6 +72,7 @@ struct nouveau_buffer {
 #include "interface/context.h"
 #include "interface/renderer.h"
 #define DRM_DRIVER_NAME nouveau
+#define DRM_DRIVER_REQUIRES_PCI true
 #include "interface/drm.h"
 IMPL(nouveau_context, wld_context)
 IMPL(nouveau_renderer, wld_renderer)
